@@ -1,6 +1,5 @@
 import { prisma } from '@/lib/db';
 import { assertTransition, InvalidTransitionError } from '@/lib/applicationStateMachine';
-import { purgeRejectedDocuments } from '@/lib/rejectApplication';
 import { rejectionReason } from '@/lib/autoDecision';
 import type { Application } from '@prisma/client';
 
@@ -20,13 +19,17 @@ export type DecideApplicationResult =
 class StaleStatusError extends Error {}
 
 // Shared by the single-application and bulk decision endpoints — one place
-// for the transition check, event logging (with rejection reason/note), and
-// document purge-on-reject, so the two routes can't drift apart.
+// for the transition check and event logging (with rejection reason/note),
+// so the two routes can't drift apart.
 export async function decideApplicationAsAdmin(params: {
   applicationId: string;
   decision: AdminDecision;
   adminEmail: string;
   note?: string;
+  // Required for 'approve' — the admin's own call on how many months the
+  // discount is good for, instead of the auto-decision path's computed
+  // discountLimitMonths(documents). Ignored for 'reject'.
+  limitMonths?: number;
 }): Promise<DecideApplicationResult> {
   const application = await prisma.application.findUnique({
     where: { id: params.applicationId },
@@ -35,6 +38,17 @@ export async function decideApplicationAsAdmin(params: {
   if (!application) return { ok: false, error: 'Табылмады', status: 404 };
 
   const nextStatus = DECISION_TO_STATUS[params.decision];
+
+  if (params.decision === 'approve') {
+    if (
+      params.limitMonths === undefined ||
+      !Number.isInteger(params.limitMonths) ||
+      params.limitMonths < 1 ||
+      params.limitMonths > 60
+    ) {
+      return { ok: false, error: 'Жеңілдік лимитін (айлар санын, 1-60) көрсету қажет', status: 400 };
+    }
+  }
 
   try {
     assertTransition(application.status, nextStatus);
@@ -56,7 +70,11 @@ export async function decideApplicationAsAdmin(params: {
       // decision with a contradictory event.
       const result = await tx.application.updateMany({
         where: { id: application.id, status: application.status },
-        data: { status: nextStatus },
+        data: {
+          status: nextStatus,
+          decidedAt: new Date(),
+          ...(params.decision === 'approve' ? { manualLimitMonths: params.limitMonths } : {}),
+        },
       });
       if (result.count === 0) {
         throw new StaleStatusError();
@@ -89,10 +107,6 @@ export async function decideApplicationAsAdmin(params: {
       };
     }
     throw e;
-  }
-
-  if (nextStatus === 'rejected') {
-    await purgeRejectedDocuments(application.id);
   }
 
   return { ok: true, application: updated };

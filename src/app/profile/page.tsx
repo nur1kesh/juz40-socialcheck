@@ -4,7 +4,7 @@ import { getCurrentUser } from '@/lib/session';
 import { prisma } from '@/lib/db';
 import { STATUS_LABELS, BENEFIT_LABELS } from '@/lib/statusLabels';
 import { discountPercentFor } from '@/lib/discount';
-import { discountLimitMonths } from '@/lib/discountLimit';
+import { discountLimitMonths, manualLimitRemainingMonths } from '@/lib/discountLimit';
 import { formatAlmatyDate } from '@/lib/timezone';
 import LogoutButton from './LogoutButton';
 import Icon from '@/components/Icon';
@@ -48,7 +48,20 @@ export default async function ProfilePage() {
   // already a fresh application in flight (draft/pending_review) — no point
   // nagging someone who's already renewing.
   const latestApproved = applications.find((a) => a.status === 'approved');
-  const approvedLimitMonths = latestApproved ? discountLimitMonths(latestApproved.documents) : null;
+  // See the identical fix (and its reasoning) in applications/[id]/page.tsx
+  // — manualLimitMonths is a fixed count anchored to the approval date,
+  // not a "months remaining as of now" value, so it can't be used as-is
+  // wherever discountLimitMonths()'s already-relative-to-now result is
+  // expected (the <=1 renewal-nudge threshold and the ===0 lapsed check
+  // just below would otherwise never fire for a manually-approved student).
+  const approvedLimitMonths = latestApproved
+    ? latestApproved.manualLimitMonths !== null
+      ? manualLimitRemainingMonths(
+          latestApproved.decidedAt ?? latestApproved.submittedAt ?? latestApproved.createdAt,
+          latestApproved.manualLimitMonths,
+        )
+      : discountLimitMonths(latestApproved.documents)
+    : null;
   const showRenewalBanner = !openApplication && approvedLimitMonths !== null && approvedLimitMonths <= 1;
   // monthsUntilExpiry clamps negative counts to 0, so "0" actually means
   // "already lapsed" and "1" means "still valid, just through this month"

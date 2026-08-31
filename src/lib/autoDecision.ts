@@ -78,9 +78,9 @@ export function decideAutomatically(documents: Document[]): AutoDecision {
 }
 
 // Only meaningful right when an application is being rejected — the caller
-// stores this in the rejection ApplicationEvent's metadata, because the
-// Document rows themselves get purged immediately after (data
-// minimization), so this is the only surviving trace of *why*.
+// stores this in the rejection ApplicationEvent's metadata as a quick,
+// structured label (admin dashboard/student page read it directly, rather
+// than re-deriving the reason from the documents every time).
 export function rejectionReason(documents: Document[]): RejectionReason | null {
   const { isExpired, isForgiven } = expiryHelpers(documents);
   if (documents.some((d) => d.documentType !== 'student_certificate' && isExpired(d) && !isForgiven(d))) {

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/db';
 import { getCurrentUser } from '@/lib/session';
 import {
@@ -30,8 +31,18 @@ const CATEGORY_LABELS: Record<string, string> = {
   // proves multi-child status — the model is told this explicitly so
   // matchesExpectedCategory comes back false for anything that isn't one
   // of these two cards.
+  //
+  // A third, explicitly-rejected trap: the exact same SOC-ID template also
+  // gets issued for "Алтын алқа"/"Күміс алқа" pendants, a former "Батыр
+  // ана" title, or "Ана даңқы" I/II degree orders — a state award for
+  // mothers historically recognized for having many children, NOT the
+  // "Көпбалалы отбасы" (multi-child family benefit) status this app
+  // grants a discount for. Same card design, same ЖСН/dates layout, only
+  // the Мәртебе/Статус text differs — so the model has to actually read
+  // that field rather than pattern-match on the template, or it'll accept
+  // an award card as if it were the benefit-status card.
   many_children_family:
-    'нақ осы екі электрондық картаның бірі: 1) "SOC-ID" картасы — үлкен "SOC-ID" деген тақырыппен, "Мәртебе/Статус" өрісінде "Көпбалалы отбасылар/Многодетные семьи" деп жазылған, "Басталған кезі — Дата начала" / "Аяқталатын кезі — Дата окончания" мерзімдерімен; 2) "Көп балалы отбасыға берілетін жәрдемақы алушысы / Получатель пособия многодетной семьи" картасы — "Берілген күні/дата выдачи" / "Аяқталған күні/дата окончания" мерзімдерімен және "Отбасы құрамы/Состав семьи" бөлімінде балалардың тізімімен. Екеуі де ЖСН/ИИН және аты-жөні бар бірдей көк градиентті шаблон. Басқа пішіндегі құжат (қағаз анықтама, әкімшілік анықтама, өзге формат) — тіпті көпбалалы мәртебені растаса да — бұл санатқа сай КЕЛМЕЙДІ',
+    'нақ осы екі электрондық картаның бірі: 1) "SOC-ID" картасы — үлкен "SOC-ID" деген тақырыппен, "Мәртебе/Статус" өрісінде НАҚ "Көпбалалы отбасылар/Многодетные семьи" деп жазылған, "Басталған кезі — Дата начала" / "Аяқталатын кезі — Дата окончания" мерзімдерімен; 2) "Көп балалы отбасыға берілетін жәрдемақы алушысы / Получатель пособия многодетной семьи" картасы — "Берілген күні/дата выдачи" / "Аяқталған күні/дата окончания" мерзімдерімен және "Отбасы құрамы/Состав семьи" бөлімінде балалардың тізімімен. Екеуі де ЖСН/ИИН және аты-жөні бар бірдей көк градиентті шаблон. Басқа пішіндегі құжат (қағаз анықтама, әкімшілік анықтама, өзге формат) — тіпті көпбалалы мәртебені растаса да — бұл санатқа сай КЕЛМЕЙДІ. Аса маңызды: дәл осындай SOC-ID шаблонындағы, бірақ "Мәртебе/Статус" өрісінде "Алтын алқа", "Күміс алқа", "Батыр ана" атағы немесе "Ана даңқы" ордені деп жазылған карта — бұл МҮЛДЕМ БАСҚА мәртебе (аналарды марапаттау), "Көпбалалы отбасылар" мәртебесі ЕМЕС, сондықтан бұл санатқа сай КЕЛМЕЙДІ (matchesExpectedCategory: false), тіпті мәтінде "көп балалы аналар" деген сөз кездессе де. Мәртебе өрісінде нақ "Көпбалалы отбасылар" немесе "Многодетные семьи" деген тіркес тұрмаса — қабылдама.',
   incomplete_family: 'толық емес отбасы (ажырасу немесе қайтыс болған ата-ана) құжаты',
   disability: 'мүгедектік жағдайын растайтын құжат',
   student_certificate: '18 жастан асқан оқушы бала үшін оқу орнынан анықтама',
@@ -110,38 +121,61 @@ export async function POST(req: NextRequest) {
   // Re-uploading the same document slot (student replacing a blurry photo,
   // or resuming a draft) should replace the old row, not add a second one
   // — otherwise decision logic that does `.find()` for a given
-  // documentType picks an arbitrary one of several.
+  // documentType picks an arbitrary one of several. The delete+create is
+  // wrapped in one transaction so two concurrent uploads of the same slot
+  // (double-click, two tabs) can't both pass `findFirst` and both create —
+  // the DB's `@@unique([applicationId, documentType])` makes the loser's
+  // `create` fail instead of silently leaving two rows of the same type.
   const existing = await prisma.document.findFirst({
     where: { applicationId: application.id, documentType },
     select: { id: true, filePath: true },
   });
-  if (existing) {
-    await prisma.document.delete({ where: { id: existing.id } });
-    await deleteDocumentFile(existing.filePath);
+
+  let document;
+  try {
+    document = await prisma.$transaction(async (tx) => {
+      if (existing) {
+        await tx.document.delete({ where: { id: existing.id } });
+      }
+      return tx.document.create({
+        data: {
+          applicationId: application.id,
+          documentType,
+          filePath: storageKey,
+          originalFilename: file.name,
+          mimeType: file.type,
+          fileSize: file.size,
+          documentIssueDate: ocr.issueDate,
+          documentExpiryDate: ocr.expiryDate,
+          ocrStatus: confident ? 'pending' : 'needs_manual_review',
+          verificationStatus: !confident
+            ? 'pending'
+            : ocr.matchesExpectedCategory === false
+              ? 'rejected'
+              : ocr.matchesExpectedCategory === true
+                ? 'verified'
+                : 'pending',
+          ocrExtractedName: ocr.extractedFullName,
+          nameMatchesProfile: confident ? namesLikelyMatch(user.fullName, ocr.extractedFullName) : null,
+        },
+      });
+    });
+  } catch (e) {
+    // The just-saved file was never referenced by any row that survived —
+    // clean it up rather than leaking it on disk.
+    await deleteDocumentFile(storageKey);
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return NextResponse.json(
+        { error: 'Бұл құжат түрі дәл қазір жүктелуде. Сәл кейін қайталаңыз.' },
+        { status: 409 },
+      );
+    }
+    throw e;
   }
 
-  const document = await prisma.document.create({
-    data: {
-      applicationId: application.id,
-      documentType,
-      filePath: storageKey,
-      originalFilename: file.name,
-      mimeType: file.type,
-      fileSize: file.size,
-      documentIssueDate: ocr.issueDate,
-      documentExpiryDate: ocr.expiryDate,
-      ocrStatus: confident ? 'pending' : 'needs_manual_review',
-      verificationStatus: !confident
-        ? 'pending'
-        : ocr.matchesExpectedCategory === false
-          ? 'rejected'
-          : ocr.matchesExpectedCategory === true
-            ? 'verified'
-            : 'pending',
-      ocrExtractedName: ocr.extractedFullName,
-      nameMatchesProfile: confident ? namesLikelyMatch(user.fullName, ocr.extractedFullName) : null,
-    },
-  });
+  if (existing) {
+    await deleteDocumentFile(existing.filePath).catch(() => {});
+  }
 
   const expiryStatus: 'valid' | 'expired' | 'unknown' = !ocr.expiryDate
     ? 'unknown'

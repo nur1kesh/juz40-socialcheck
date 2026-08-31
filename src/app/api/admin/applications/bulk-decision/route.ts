@@ -7,6 +7,9 @@ const schema = z.object({
   ids: z.array(z.string()).min(1).max(100),
   decision: z.enum(['approve', 'reject']),
   note: z.string().max(1000).optional(),
+  // Applied to every application in the batch when decision is 'approve' —
+  // decideApplicationAsAdmin rejects each one individually if it's missing.
+  limitMonths: z.number().int().min(1).max(60).optional(),
 });
 
 // Applies the same per-application decision logic as the single-application
@@ -44,6 +47,7 @@ export async function POST(req: NextRequest) {
           decision: parsed.data.decision,
           adminEmail: admin.email,
           note: parsed.data.note,
+          limitMonths: parsed.data.limitMonths,
         }),
       ),
     );

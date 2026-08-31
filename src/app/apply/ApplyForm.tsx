@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { BENEFIT_LABELS } from '@/lib/statusLabels';
 import { discountPercentFor } from '@/lib/discount';
+import { discountLimitMonths, discountValidUntilLabel } from '@/lib/discountLimit';
 import { formatAlmatyDate, isPastAlmatyDay } from '@/lib/timezone';
 import Icon from '@/components/Icon';
 
@@ -68,7 +69,20 @@ export default function ApplyForm() {
       .then((res) => res.json())
       .then((data) => {
         const match = data.applications?.find((a: { id: string }) => a.id === existingApplicationId);
-        if (!match) return;
+        // Only a draft is actually resumable — a rejected/approved/pending
+        // application's id can end up here from a stale bookmark or a
+        // manually-edited URL (the app's own links never point one there).
+        // Documents now survive a rejection (see decideApplicationAdmin.ts),
+        // so without this check a rejected application's old, already-final
+        // document chips would get restored into the upload step as if
+        // still editable — then every upload/remove/submit action on them
+        // 409s, since the state machine has no way out of 'rejected' except
+        // a brand-new draft. Falling through to a fresh draft instead
+        // matches what happens when no applicationId is given at all.
+        if (!match || match.status !== 'draft') {
+          setApplicationId(null);
+          return;
+        }
         setBenefitTypes(match.benefitTypes);
         const restoredDocs: Partial<Record<string, UploadedDoc>> = {};
         for (const d of match.documents ?? []) {
@@ -179,6 +193,28 @@ export default function ApplyForm() {
 
   const allDocsReady = benefitTypes.every((t) => docs[t]);
 
+  // Preview-only estimate of how long the discount will run, computed from
+  // the same rule the backend uses once the application is decided (the
+  // shortest-lived supporting document bounds it) — so the student sees
+  // roughly what to expect before submitting, not just after approval.
+  const limitPreviewDocs = [
+    ...benefitTypes
+      .filter((t) => docs[t])
+      .map((t) => ({ documentType: t, documentExpiryDate: docs[t]!.ocr.expiryDate ? new Date(docs[t]!.ocr.expiryDate!) : null })),
+    ...(docs.student_certificate
+      ? [
+          {
+            documentType: 'student_certificate',
+            documentExpiryDate: docs.student_certificate.ocr.expiryDate
+              ? new Date(docs.student_certificate.ocr.expiryDate)
+              : null,
+          },
+        ]
+      : []),
+  ];
+  const limitMonthsPreview = discountLimitMonths(limitPreviewDocs);
+  const validUntilPreview = limitMonthsPreview !== null ? discountValidUntilLabel(limitMonthsPreview) : null;
+
   async function handleSubmit() {
     if (!applicationId || !allDocsReady || !confirmed) return;
     setSubmitting(true);
@@ -280,14 +316,29 @@ export default function ApplyForm() {
                 }
               />
               {type === 'many_children_family' && (
-                <a
-                  href="https://youtube.com/shorts/fgsrgIByolQ?si=mdkjRkKhiCyjku1Z"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 self-start text-sm font-semibold text-forest-700 underline decoration-2 underline-offset-2 hover:text-forest-900"
-                >
-                  <Icon name="play" className="h-3.5 w-3.5" /> SOC-ID қалай алуға болады — видео нұсқаулық
-                </a>
+                <>
+                  <a
+                    href="https://youtube.com/shorts/fgsrgIByolQ?si=mdkjRkKhiCyjku1Z"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 self-start text-sm font-semibold text-forest-700 underline decoration-2 underline-offset-2 hover:text-forest-900"
+                  >
+                    <Icon name="play" className="h-3.5 w-3.5" /> SOC-ID қалай алуға болады — видео нұсқаулық
+                  </a>
+                  <div className="flex items-center gap-2.5 rounded-xl bg-forest-50 px-3.5 py-3 text-xs font-semibold leading-relaxed text-ink">
+                    <Icon name="info" className="h-3.5 w-3.5 shrink-0 text-forest-700" />
+                    Kaspi.kz ➔ «Госуслуги» (Мемлекеттік қызметтер) ➔ «Социальный ID» (Әлеуметтік ID)
+                  </div>
+                  <div className="flex gap-2.5 rounded-xl bg-clay-400/10 px-3.5 py-3">
+                    <Icon name="alert" className="mt-0.5 h-4 w-4 shrink-0 text-clay-500" />
+                    <p className="text-xs font-medium leading-relaxed text-clay-500">
+                      <strong>ЕСКЕРТУ:</strong> Жеңілдікті белсендіру тек Соц ID арқылы жүзеге асырылады. Туу
+                      туралы куәлік жүйе тарапынан қабылданбайды және онымен жеңілдік берілмейді. Деректерді
+                      енгізу кезінде мұқият болуыңызды сұраймыз: қате, жалған немесе сәйкес келмейтін құжаттар
+                      жүктелген жағдайда, жүйе өтінімді автоматты түрде қабылдамайды.
+                    </p>
+                  </div>
+                </>
               )}
             </div>
           ))}
@@ -335,23 +386,62 @@ export default function ApplyForm() {
           <div className="card">
             <h2 className="eyebrow mb-2">Әлеуметтік мәртебе</h2>
             <p className="font-medium text-ink">{benefitTypes.map((t) => BENEFIT_LABELS[t]).join(', ')}</p>
-            <p className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-gold-100/70 px-3 py-1 text-sm font-semibold text-gold-600">
-              {discountPercentFor(benefitTypes)}% жеңілдік
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="inline-flex items-center gap-1.5 rounded-full bg-gold-100/70 px-3 py-1 text-sm font-semibold text-gold-600">
+                {discountPercentFor(benefitTypes)}% жеңілдік
+              </p>
+              {limitMonthsPreview !== null && (
+                <p className="inline-flex items-center gap-1.5 rounded-full bg-forest-100 px-3 py-1 text-sm font-semibold text-forest-700">
+                  <Icon name="hourglass" className="h-3.5 w-3.5" />
+                  {limitMonthsPreview} ай мерзімге
+                </p>
+              )}
+            </div>
+            <p className="mt-2 text-xs leading-relaxed text-ink-faint">
+              {validUntilPreview
+                ? `Болжам: жеңілдік ${validUntilPreview} қолданыста болады — құжаттарыңыздың мерзіміне байланысты. Түпкілікті мерзімді әкімшілік растайды.`
+                : 'Жеңілдіктің қолданылу мерзімі құжаттарыңыз тексерілгеннен кейін әкімшілік тарапынан белгіленеді.'}
             </p>
           </div>
           <div className="card">
-            <h2 className="eyebrow mb-2">Құжаттар</h2>
-            <ul className="flex flex-col gap-1.5">
-              {benefitTypes.map((t) => (
-                <li key={t} className="flex items-center gap-2 text-sm text-ink">
-                  <Icon name="check" className="h-3.5 w-3.5 text-forest-600" /> {docs[t]?.fileName}
+            <h2 className="eyebrow mb-3">Құжаттар — ИИ танылған деректер</h2>
+            <ul className="flex flex-col divide-y divide-forest-900/8">
+              {[
+                ...benefitTypes.map((t) => ({
+                  key: t,
+                  label: t === 'many_children_family' ? 'SOC-ID / жәрдемақы алушысы картасы' : BENEFIT_LABELS[t],
+                  doc: docs[t],
+                })),
+                ...(docs.student_certificate
+                  ? [{ key: 'student_certificate', label: 'Оқу орнынан анықтама', doc: docs.student_certificate }]
+                  : []),
+              ].map(({ key, label, doc }) => (
+                <li key={key} className="flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0">
+                  <div className="flex items-center gap-2 text-sm font-medium text-ink">
+                    <Icon name="check" className="h-3.5 w-3.5 shrink-0 text-forest-600" />
+                    <span className="truncate">{doc?.fileName}</span>
+                  </div>
+                  <div className="ml-5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-faint">
+                    <span>{label}</span>
+                    {doc?.ocr.extractedFullName && (
+                      <span>
+                        <Icon name="single-parent" className="mr-1 inline h-3 w-3 -translate-y-px" />
+                        {doc.ocr.extractedFullName}
+                      </span>
+                    )}
+                    {doc?.ocr.expiryDate && (
+                      <span
+                        className={
+                          doc.ocr.expiryStatus === 'expired' ? 'font-semibold text-gold-600' : undefined
+                        }
+                      >
+                        {doc.ocr.expiryStatus === 'expired' ? 'Мерзімі өткен' : 'Жарамды'} —{' '}
+                        {formatAlmatyDate(new Date(doc.ocr.expiryDate))} дейін
+                      </span>
+                    )}
+                  </div>
                 </li>
               ))}
-              {docs.student_certificate && (
-                <li className="flex items-center gap-2 text-sm text-ink">
-                  <Icon name="check" className="h-3.5 w-3.5 text-forest-600" /> {docs.student_certificate.fileName}
-                </li>
-              )}
             </ul>
           </div>
           <label className="flex cursor-pointer items-start gap-3 rounded-xl px-1 py-2 text-sm text-ink-soft">

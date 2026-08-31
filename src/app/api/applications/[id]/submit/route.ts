@@ -3,7 +3,6 @@ import { prisma } from '@/lib/db';
 import { getCurrentUser } from '@/lib/session';
 import { assertTransition, InvalidTransitionError } from '@/lib/applicationStateMachine';
 import { decideAutomatically, rejectionReason } from '@/lib/autoDecision';
-import { purgeRejectedDocuments } from '@/lib/rejectApplication';
 import type { Application } from '@prisma/client';
 
 // Thrown internally when the row's status changed between our read and our
@@ -34,8 +33,8 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
 
   // Fully automated decision (OCR-scored per document, aggregated in
   // decideAutomatically): approved (discount granted, saved) or rejected
-  // (no discount, documents purged) resolve immediately; pending_review is
-  // the only case a human ever touches.
+  // (no discount) resolve immediately; pending_review is the only case a
+  // human ever touches.
   const finalStatus = decideAutomatically(application.documents);
 
   try {
@@ -60,10 +59,18 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       // Compare-and-swap against the draft status we just read — closes
       // the window for a double-submit (two tabs, a slow first request
       // retried) to both pass the assertTransition check above and both
-      // write + purge documents for the same application.
+      // write a contradictory decision for the same application.
       const result = await tx.application.updateMany({
         where: { id: application.id, status: application.status },
-        data: { status: finalStatus, submittedAt: now },
+        data: {
+          status: finalStatus,
+          submittedAt: now,
+          // pending_review isn't a decision yet — only approved/rejected
+          // are terminal, so only those get a decidedAt (see the renewal
+          // cooldown in applications/route.ts, which needs this fixed once
+          // and never touched again).
+          ...(finalStatus !== 'pending_review' ? { decidedAt: now } : {}),
+        },
       });
       if (result.count === 0) {
         throw new StaleStatusError();
@@ -90,10 +97,6 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       return NextResponse.json({ error: 'Бұл өтінім басқа сұраныспен өзгертілді. Қайта көріңіз.' }, { status: 409 });
     }
     throw e;
-  }
-
-  if (finalStatus === 'rejected') {
-    await purgeRejectedDocuments(application.id);
   }
 
   return NextResponse.json({ application: updated });

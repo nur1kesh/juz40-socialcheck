@@ -4,9 +4,10 @@ import { getCurrentUser } from '@/lib/session';
 import { prisma } from '@/lib/db';
 import { STATUS_LABELS, BENEFIT_LABELS } from '@/lib/statusLabels';
 import { discountPercentFor } from '@/lib/discount';
-import { discountLimitMonths, discountValidUntilLabel } from '@/lib/discountLimit';
+import { discountLimitMonths, discountValidUntilLabel, manualLimitRemainingMonths } from '@/lib/discountLimit';
 import { formatAlmatyDateTime } from '@/lib/timezone';
 import ResubmitButton from './ResubmitButton';
+import ReportActivationIssueButton from './ReportActivationIssueButton';
 import Icon from '@/components/Icon';
 import type { ApplicationStatus } from '@prisma/client';
 
@@ -29,7 +30,23 @@ export default async function ApplicationStatusPage({ params }: { params: { id: 
 
   const hero = HERO[application.status];
 
-  const limitMonths = application.status === 'approved' ? discountLimitMonths(application.documents) : null;
+  // A manual admin approval carries its own explicitly-chosen limit (see
+  // decideApplicationAsAdmin) — but that number is a fixed count anchored
+  // to the approval date ("valid for N months from decidedAt"), not a
+  // "months remaining as of now" value the way discountLimitMonths()'s
+  // result already is. manualLimitRemainingMonths re-anchors it so both
+  // paths produce the same shape from here on — without this, the
+  // displayed end date would silently slide later every time this page is
+  // viewed, and an expired manual approval could never show as expired.
+  const limitMonths =
+    application.status === 'approved'
+      ? application.manualLimitMonths !== null
+        ? manualLimitRemainingMonths(
+            application.decidedAt ?? application.submittedAt ?? application.createdAt,
+            application.manualLimitMonths,
+          )
+        : discountLimitMonths(application.documents)
+      : null;
   const validUntilLabel = limitMonths !== null ? discountValidUntilLabel(limitMonths) : null;
   // discountValidUntilLabel returns null for months<=0 (nothing to render
   // as an upcoming end date) — but that collapses "already lapsed" into
@@ -76,35 +93,50 @@ export default async function ApplicationStatusPage({ params }: { params: { id: 
         </h1>
       </div>
 
+      {/* No heading here — the hero above already reads "Тексерілуде";
+          repeating it as a card title would just be the same word twice. */}
       {application.status === 'pending_review' && (
         <div className="card animate-scale-in mb-4" style={{ animationDelay: '100ms' }}>
-          <h2 className="mb-2 font-display text-lg font-medium text-forest-950">
-            Тексерілуде
-          </h2>
           <p className="text-sm leading-relaxed text-ink-soft">
             Сіздің құжаттарыңыз менеджерлердің тексерісінде, күтуіңізді сұраймыз.
           </p>
         </div>
       )}
 
-      {application.status === 'approved' && (
-        <div className="card animate-scale-in mb-4" style={{ animationDelay: '100ms' }}>
-          <h2 className="mb-2 font-display text-lg font-medium text-forest-950">
-            Мақұлданды
+      {application.status === 'approved' && application.discountActivatedAt && (
+        <div className="card animate-scale-in mb-4 border-2 border-forest-500/40 bg-forest-50/60" style={{ animationDelay: '100ms' }}>
+          <h2 className="mb-2 inline-flex items-center gap-2 font-display text-lg font-medium text-forest-950">
+            <Icon name="check-circle" className="h-5 w-5 text-forest-700" /> Жеңілдік белсендірілді
           </h2>
-          <p className="mb-3 text-sm leading-relaxed text-ink-soft">
-            Сізге 24 сағат ішінде аккаунтыңызға жеңілдік берілетін болады.
+          <p className="mb-1 text-sm leading-relaxed text-ink-soft">
+            Жеңілдік аккаунтыңызда сәтті іске қосылды — енді төлемдерді жеңілдікпен жасай аласыз.
           </p>
-          {alreadyExpired ? (
+          <ReportActivationIssueButton
+            applicationId={application.id}
+            initiallyDisputed={Boolean(application.activationDisputedAt)}
+          />
+        </div>
+      )}
+
+      {/* The non-expired validity window is deliberately NOT repeated here —
+          it's already the "Жеңілдік мерзімі" row in the details card right
+          below. This card only earns its place for messages that appear
+          nowhere else: the pre-activation wait notice, and the expired
+          warning (discountValidUntilLabel returns null past expiry, so the
+          details table would otherwise say nothing about it at all). */}
+      {application.status === 'approved' && (!application.discountActivatedAt || alreadyExpired) && (
+        <div className="card animate-scale-in mb-4" style={{ animationDelay: '100ms' }}>
+          {/* No heading here either — the hero above already reads
+              "Мақұлданды". */}
+          {!application.discountActivatedAt && (
+            <p className="mb-3 text-sm leading-relaxed text-ink-soft">
+              Сізге 24 сағат ішінде аккаунтыңызға жеңілдік берілетін болады.
+            </p>
+          )}
+          {alreadyExpired && (
             <p className="inline-flex items-center gap-1.5 rounded-full bg-clay-400/15 px-3 py-1.5 text-sm font-bold text-clay-500">
               <Icon name="alert" className="h-4 w-4" /> Жеңілдік мерзімі аяқталды — жаңарту үшін жаңа өтінім беріңіз
             </p>
-          ) : (
-            validUntilLabel && (
-              <p className="inline-flex items-center gap-1.5 rounded-full bg-forest-100 px-3 py-1.5 text-sm font-bold text-forest-800">
-                <Icon name="hourglass" className="h-4 w-4" /> Жеңілдік мерзімі: {validUntilLabel}
-              </p>
-            )
           )}
         </div>
       )}

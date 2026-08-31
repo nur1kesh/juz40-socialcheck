@@ -24,8 +24,8 @@ export async function GET(_req: NextRequest, { params }: { params: { id: string 
     return NextResponse.json({ error: 'Табылмады' }, { status: 404 });
   }
 
-  // The file can vanish between this read and now (rejection purge running
-  // concurrently) — fail closed with the same 404 rather than an unhandled
+  // The file can vanish between this read and now (e.g. removed on disk
+  // out-of-band) — fail closed with the same 404 rather than an unhandled
   // 500 from a raw ENOENT.
   const buffer = await readDocumentFile(document.filePath).catch(() => null);
   if (!buffer) {
@@ -37,6 +37,10 @@ export async function GET(_req: NextRequest, { params }: { params: { id: string 
       'Content-Type': document.mimeType,
       'Content-Disposition': `inline; filename="${encodeURIComponent(document.originalFilename)}"`,
       'Cache-Control': 'private, no-store',
+      // Defense-in-depth: mimeType is already magic-byte-verified at upload
+      // (see storage.ts), but this stops a browser from ever second-guessing
+      // it and sniffing a document's actual bytes as something executable.
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 }

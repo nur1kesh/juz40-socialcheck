@@ -76,6 +76,40 @@ const KAZAKH_MONTHS = [
   'желтоқсан',
 ];
 
+// `manualLimitMonths` is a FIXED count an admin typed at approval time
+// ("valid for N months") — anchored to the approval date, unlike
+// discountLimitMonths()'s result, which is already "months remaining as of
+// now" and gets recomputed fresh on every call from each document's fixed
+// expiry date. Passing manualLimitMonths directly wherever a "months
+// remaining as of now" number is expected (discountValidUntilLabel, an
+// `=== 0` "already expired" check, a renewal-reminder threshold) would be
+// wrong: the displayed end date would silently slide later every time the
+// page is viewed (it's always "N months from *today*" instead of a fixed
+// point), and "already expired" would become unreachable since the fixed
+// admin number never decreases.
+//
+// This resolves the actual fixed target month once (decidedAt +
+// manualLimitMonths, inclusive — same "1 limit = 1 calendar month" rule as
+// monthsUntilExpiry), then re-expresses it as months remaining from `now`
+// — exactly the shape a real document expiry date would produce — so
+// callers can treat a manually-approved and an auto-approved application
+// identically from this point on.
+export function manualLimitRemainingMonths(
+  decidedAt: Date,
+  manualLimitMonths: number,
+  now: Date = new Date(),
+): number {
+  const d = almatyYearMonth(decidedAt);
+  const targetMonthIndex = d.month + (manualLimitMonths - 1);
+  const targetYear = d.year + Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  // Any day safely inside the target month works — only the year/month
+  // bucket matters (see almatyYearMonth/monthsUntilExpiry), and day 15
+  // keeps this away from any month-boundary timezone-offset edge case.
+  const withinTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 15));
+  return monthsUntilExpiry(withinTargetMonth, now);
+}
+
 // Renders a month-count limit as the actual calendar month it runs through
 // — "1 лимит = 1 ай" means the limit expires at the END of that Nth month,
 // not N months from today to the day, so a day-level date would overstate

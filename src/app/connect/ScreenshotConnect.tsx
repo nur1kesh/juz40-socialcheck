@@ -15,7 +15,7 @@ type Draft = {
 const EMPTY_DRAFT: Draft = {
   fullName: '',
   email: '',
-  whatsapp: '',
+  whatsapp: '+7',
 };
 
 const FIELD_LABELS: Record<keyof Draft, string> = {
@@ -26,8 +26,36 @@ const FIELD_LABELS: Record<keyof Draft, string> = {
 
 const FIELD_INPUT_PROPS: Partial<Record<keyof Draft, React.InputHTMLAttributes<HTMLInputElement>>> = {
   email: { type: 'email', inputMode: 'email', placeholder: 'name@example.com' },
-  whatsapp: { type: 'tel', inputMode: 'tel', placeholder: '+77000000000' },
 };
+
+// The "+7" country code is rendered as a fixed prefix outside the editable
+// input (see the whatsapp field below), so the student only ever types the
+// 10-digit local number — never has to type, and can't accidentally erase,
+// the country code. This extracts just those local digits from any raw
+// input (OCR output, a pasted full number with or without a leading 7/8,
+// or plain typing), capped at 10.
+function kzLocalDigits(raw: string): string {
+  let digits = raw.replace(/\D/g, '');
+  if (digits.length === 11 && (digits.startsWith('7') || digits.startsWith('8'))) {
+    digits = digits.slice(1);
+  }
+  return digits.slice(0, 10);
+}
+
+// For every ORGANIC KEYSTROKE in the local-only input (see the whatsapp
+// field below, and its separate onPaste handler for clipboard input).
+// Plain `kzLocalDigits` can't be reused here: its "11 digits starting with
+// 7/8 -> drop the first one" heuristic is meant for a pasted full number
+// (country code included), but typing a normal 10-digit local number one
+// keystroke at a time also passes through an "11 digits starting with 7"
+// shape the instant a student who's already at 10 digits presses one more
+// key — and at that point the heuristic drops the FIRST digit instead of
+// ignoring the extra keystroke, making the field appear to shift left.
+// A single keystroke never contains a country code, so no stripping is
+// ever correct here — just cap.
+function capLocalDigits(raw: string): string {
+  return raw.replace(/\D/g, '').slice(0, 10);
+}
 
 export default function ScreenshotConnect() {
   const router = useRouter();
@@ -121,7 +149,7 @@ export default function ScreenshotConnect() {
       const res = await fetch('/api/connect/screenshot', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? 'Қате шықты');
-      setDraft({ ...EMPTY_DRAFT, ...data });
+      setDraft({ ...EMPTY_DRAFT, ...data, whatsapp: `+7${kzLocalDigits(data.whatsapp ?? '')}` });
       goToStep('review', 'forward');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Қате шықты');
@@ -277,34 +305,67 @@ export default function ScreenshotConnect() {
       <div className="flex flex-col gap-4">
         {(Object.keys(FIELD_LABELS) as (keyof Draft)[]).map((key) => {
           const showError = touched[key] && fieldErrors[key];
+          const borderClass = showError
+            ? 'border-clay-500 focus-within:border-clay-500 focus-within:ring-clay-500/20'
+            : 'border-forest-900/12 focus-within:border-forest-500 focus-within:ring-forest-500/20';
           return (
             <label key={key} className="block">
               <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-ink-faint">
                 {FIELD_LABELS[key]}
               </span>
-              <input
-                value={draft[key]}
-                onChange={(e) => {
-                  const raw = e.target.value;
-                  const value = key === 'whatsapp' ? raw.replace(/[\s\-()]/g, '') : raw;
-                  setDraft({ ...draft, [key]: value });
-                }}
-                onBlur={() => setTouched((t) => ({ ...t, [key]: true }))}
-                aria-invalid={Boolean(showError)}
-                className={`w-full rounded-xl border bg-paper-soft px-4 py-3 text-[15px] text-ink outline-none transition focus:ring-2 ${
-                  showError
-                    ? 'border-clay-500 focus:border-clay-500 focus:ring-clay-500/20'
-                    : 'border-forest-900/12 focus:border-forest-500 focus:ring-forest-500/20'
-                }`}
-                {...FIELD_INPUT_PROPS[key]}
-              />
+              {key === 'whatsapp' ? (
+                <div
+                  className={`flex w-full items-center rounded-xl border bg-paper-soft pl-4 pr-1 text-[15px] text-ink transition focus-within:ring-2 ${borderClass}`}
+                >
+                  <span className="select-none text-ink-faint">+7</span>
+                  <input
+                    value={draft.whatsapp.slice(2)}
+                    onChange={(e) => {
+                      setDraft({ ...draft, whatsapp: `+7${capLocalDigits(e.target.value)}` });
+                    }}
+                    onPaste={(e) => {
+                      // A paste can legitimately contain a full number with
+                      // the country code (+7/8 prefix) — handled here, with
+                      // its own normalization, instead of onChange, so a
+                      // single keystroke's simpler cap-only logic never has
+                      // to guess whether a change was typed or pasted.
+                      e.preventDefault();
+                      const pasted = e.clipboardData.getData('text');
+                      setDraft({ ...draft, whatsapp: `+7${kzLocalDigits(pasted)}` });
+                    }}
+                    onBlur={() => setTouched((t) => ({ ...t, whatsapp: true }))}
+                    aria-invalid={Boolean(showError)}
+                    type="tel"
+                    inputMode="tel"
+                    placeholder="7000000000"
+                    className="w-full bg-transparent py-3 pl-1 outline-none"
+                  />
+                </div>
+              ) : (
+                <input
+                  value={draft[key]}
+                  onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+                  onBlur={() => setTouched((t) => ({ ...t, [key]: true }))}
+                  aria-invalid={Boolean(showError)}
+                  className={`w-full rounded-xl border bg-paper-soft px-4 py-3 text-[15px] text-ink outline-none transition focus:ring-2 ${borderClass}`}
+                  {...FIELD_INPUT_PROPS[key]}
+                />
+              )}
               {showError && <p className="mt-1.5 text-xs font-medium text-clay-500">{fieldErrors[key]}</p>}
             </label>
           );
         })}
       </div>
 
-      <label className="mt-5 flex cursor-pointer items-start gap-3 text-sm text-ink-soft">
+      <div className="mt-5 flex gap-2.5 rounded-xl bg-clay-400/10 px-3.5 py-3">
+        <Icon name="alert" className="mt-0.5 h-4 w-4 shrink-0 text-clay-500" />
+        <p className="text-xs font-medium leading-relaxed text-clay-500">
+          Тек <strong>оқушының жеке аккаунты</strong> қабылданады — ата-ана аккаунты немесе қате дерек
+          жеңілдіктің есептелмеуіне әкеледі.
+        </p>
+      </div>
+
+      <label className="mt-4 flex cursor-pointer items-start gap-3 text-sm text-ink-soft">
         <input
           type="checkbox"
           checked={confirmed}

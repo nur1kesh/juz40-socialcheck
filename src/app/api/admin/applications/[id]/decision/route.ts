@@ -10,6 +10,7 @@ import { decideApplicationAsAdmin } from '@/lib/decideApplicationAdmin';
 const schema = z.object({
   decision: z.enum(['approve', 'reject']),
   note: z.string().max(1000).optional(),
+  limitMonths: z.number().int().min(1).max(60).optional(),
 });
 
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
@@ -26,6 +27,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     decision: parsed.data.decision,
     adminEmail: admin.email,
     note: parsed.data.note,
+    limitMonths: parsed.data.limitMonths,
   });
 
   if (!result.ok) {

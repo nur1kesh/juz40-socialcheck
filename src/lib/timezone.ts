@@ -22,6 +22,13 @@ export function almatyDayBoundsUtc(dd: string, mm: string, yyyy: string): { star
   return { start, end };
 }
 
+// Converts a `<input type="datetime-local">` value ("YYYY-MM-DDTHH:mm"),
+// interpreted as Almaty wall-clock time (the timezone every admin-facing
+// date filter in this app assumes), to the correct UTC instant.
+export function almatyLocalToUtc(dateTimeLocal: string): Date {
+  return new Date(`${dateTimeLocal}:00.000+05:00`);
+}
+
 // Almaty-local {year, month} for a given instant — used for "how many
 // calendar months away" computations (discountLimit.ts) so a document
 // expiring right around midnight UTC isn't attributed to the wrong month.

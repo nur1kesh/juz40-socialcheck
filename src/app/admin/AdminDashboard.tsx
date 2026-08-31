@@ -1,10 +1,11 @@
 'use client';
 
-import { Fragment, useMemo, useState, useEffect } from 'react';
+import { Fragment, useMemo, useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { STATUS_LABELS, BENEFIT_LABELS } from '@/lib/statusLabels';
 import { discountPercentFor } from '@/lib/discount';
-import { todayAlmatyIso, formatAlmatyDateTime } from '@/lib/timezone';
+import { discountLimitMonths } from '@/lib/discountLimit';
+import { formatAlmatyDate, formatAlmatyDateTime } from '@/lib/timezone';
 import Icon from '@/components/Icon';
 import type { ApplicationStatus, BenefitType } from '@prisma/client';
 
@@ -24,8 +25,16 @@ type ApplicationRow = {
   benefitTypes: BenefitType[];
   createdAt: string;
   submittedAt: string | null;
+  discountActivatedAt: string | null;
+  activationDisputedAt: string | null;
   user: { fullName: string; email: string; whatsapp: string };
-  documents: { id: string; originalFilename: string; nameMatchesProfile: boolean | null }[];
+  documents: {
+    id: string;
+    originalFilename: string;
+    nameMatchesProfile: boolean | null;
+    documentType: string;
+    documentExpiryDate: string | null;
+  }[];
   events: ApplicationEventRow[];
 };
 
@@ -41,14 +50,51 @@ function rejectionReasonLabel(app: ApplicationRow): string | null {
   return reason ? (REJECTION_REASON_LABELS[reason] ?? null) : null;
 }
 
+// The same rule the auto-decision path uses (shortest-lived supporting
+// document bounds the limit) — surfaced here so the admin doesn't have to
+// open every document and do the date math by hand before typing a number
+// into the approve modal. Still just a suggestion: the admin can override
+// it, and manually-approved applications already store their own
+// `manualLimitMonths` once decided (see decideApplicationAdmin.ts).
+function suggestedLimitMonths(documents: ApplicationRow['documents']): number | null {
+  return discountLimitMonths(
+    documents.map((d) => ({
+      documentType: d.documentType,
+      documentExpiryDate: d.documentExpiryDate ? new Date(d.documentExpiryDate) : null,
+    })),
+  );
+}
+
+// A secondary pill under the main status chip — mirrors rejectionReasonLabel's
+// pattern, but for the activation-confirmation flow, which is orthogonal to
+// `status` (see activateDiscount.ts): an 'approved' application can be
+// not-yet-activated, activated, or activated-but-disputed.
+function activationBadge(app: ApplicationRow): { label: string; tone: string } | null {
+  if (app.status !== 'approved') return null;
+  if (app.activationDisputedAt) return { label: 'Шағым: белсендірілмеді', tone: 'bg-clay-400/15 text-clay-500' };
+  if (app.discountActivatedAt) return { label: 'Белсендірілді', tone: 'bg-forest-100 text-forest-700' };
+  return null;
+}
+
 const EVENT_TYPE_LABELS: Record<string, string> = {
   submitted: 'Жіберілді',
   auto_decision: 'Автоматты шешім',
   admin_approve: 'Админ мақұлдады',
   admin_reject: 'Админ қабылдамады',
+  discount_activated: 'Жеңілдік белсендірілді',
+  activation_disputed: 'Студент белсендірілмеді деп хабарлады',
+  activation_dispute_resolved: 'Шағым шешілді',
 };
 
 type PendingDecision = { ids: string[]; label: string; decision: 'approve' | 'reject' };
+
+type ActivationImportSummary = {
+  activated: string[];
+  alreadyActivated: string[];
+  noApprovedApplication: string[];
+  notFound: string[];
+  invalid: string[];
+};
 
 type AiUsage = {
   totals: { calls: number; promptTokens: number; completionTokens: number; totalTokens: number; costUsd: number };
@@ -80,7 +126,7 @@ const selectClass =
   'rounded-xl border border-forest-900/12 bg-paper-card px-3.5 py-2.5 text-sm text-ink outline-none transition focus:border-forest-500 focus:ring-2 focus:ring-forest-500/15';
 
 type SortKey = 'submittedAt' | 'fullName';
-type Page = 'applications' | 'analytics';
+type Page = 'applications' | 'analytics' | 'statistics';
 
 export default function AdminDashboard() {
   const router = useRouter();
@@ -91,7 +137,8 @@ export default function AdminDashboard() {
   const [status, setStatus] = useState('pending_review');
   const [benefitType, setBenefitType] = useState('');
   const [email, setEmail] = useState('');
-  const [date, setDate] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
@@ -99,10 +146,16 @@ export default function AdminDashboard() {
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [pendingDecision, setPendingDecision] = useState<PendingDecision | null>(null);
   const [decisionNote, setDecisionNote] = useState('');
+  const [decisionLimitMonths, setDecisionLimitMonths] = useState('');
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [deciding, setDeciding] = useState(false);
-  const [exportDate, setExportDate] = useState(todayAlmatyIso());
+  const [exportDateFrom, setExportDateFrom] = useState('');
+  const [exportDateTo, setExportDateTo] = useState('');
   const [exportStatus, setExportStatus] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<ActivationImportSummary | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [resolvingDisputeId, setResolvingDisputeId] = useState<string | null>(null);
   const [usage, setUsage] = useState<AiUsage | null>(null);
   const [stats, setStats] = useState<Record<string, number>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -119,7 +172,8 @@ export default function AdminDashboard() {
       if (s) params.set('status', s);
       if (benefitType) params.set('benefitType', benefitType);
       if (email) params.set('email', email);
-      if (date) params.set('date', date);
+      if (dateFrom) params.set('dateFrom', dateFrom);
+      if (dateTo) params.set('dateTo', dateTo);
       const res = await fetch(`/api/admin/applications?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? 'Қате шықты');
@@ -181,6 +235,61 @@ export default function AdminDashboard() {
     });
   }
 
+  // Opens the decision modal and, for approvals, pre-fills the limit field
+  // with the document-derived suggestion instead of leaving the admin to
+  // calculate it by hand. Bulk-selecting rows whose documents suggest
+  // different limits leaves the field blank rather than silently applying
+  // one row's number to all of them — the modal's hint (below) then spells
+  // out the mismatch instead of pretending there's a single right answer.
+  // One suggestion per id, in the same order — deliberately NOT filtering
+  // out the nulls ("this application's documents don't imply any specific
+  // limit") before comparing them, unlike an earlier version of this code.
+  // A bulk selection where some rows have a known suggestion and others
+  // don't is just as much a "can't apply one shared number" case as rows
+  // disagreeing on a number — filtering nulls out first made that case
+  // silently look like full agreement (pre-filling the one known number
+  // for every row, including the ones it doesn't apply to at all).
+  function limitSuggestionsFor(ids: string[]): (number | null)[] {
+    return ids
+      .map((id) => applications.find((a) => a.id === id))
+      .filter((a): a is ApplicationRow => Boolean(a))
+      .map((a) => suggestedLimitMonths(a.documents));
+  }
+
+  function openDecision(ids: string[], label: string, decision: 'approve' | 'reject') {
+    setPendingDecision({ ids, label, decision });
+    setDecisionNote('');
+    setDecisionError(null);
+    if (decision === 'approve') {
+      const unique = [...new Set(limitSuggestionsFor(ids))];
+      setDecisionLimitMonths(unique.length === 1 && unique[0] !== null ? String(unique[0]) : '');
+    } else {
+      setDecisionLimitMonths('');
+    }
+  }
+
+  // Rendered under the limit input — explains where the pre-filled number
+  // came from, or, for a bulk selection whose documents disagree (or where
+  // some simply have no document-derived answer at all), warns that one
+  // shared number can't be right for all of them instead of silently going
+  // with whatever the field happens to hold.
+  function approveLimitHint(ids: string[]): string | null {
+    const suggestions = limitSuggestionsFor(ids);
+    const unique = [...new Set(suggestions)];
+    if (unique.length === 1) {
+      return unique[0] !== null ? `Ұсынылады: ${unique[0]} ай (құжат мерзіміне негізделген).` : null;
+    }
+    if (ids.length > 1) {
+      const known = suggestions.filter((n): n is number => n !== null).sort((a, b) => a - b);
+      const unknownCount = suggestions.length - known.length;
+      const knownPart = known.length > 0 ? `белгілі мерзімдер: ${known.join(', ')} ай` : '';
+      const unknownPart = unknownCount > 0 ? `${unknownCount} өтінімнің құжат мерзімі анықталмаған` : '';
+      const detail = [knownPart, unknownPart].filter(Boolean).join('; ');
+      return `Таңдалған өтінімдердің құжат мерзімдері әртүрлі (${detail}) — бір санмен бекітпей, әрқайсысын жеке тексеріңіз.`;
+    }
+    return null;
+  }
+
   const pendingRows = sortedApplications.filter((a) => a.status === 'pending_review');
   const allPendingSelected = pendingRows.length > 0 && pendingRows.every((a) => selected.has(a.id));
 
@@ -203,6 +312,7 @@ export default function AdminDashboard() {
           ids: pendingDecision.ids,
           decision: pendingDecision.decision,
           note: decisionNote.trim() || undefined,
+          limitMonths: pendingDecision.decision === 'approve' ? Number(decisionLimitMonths) : undefined,
         }),
       });
       const data = await res.json().catch(() => null);
@@ -212,10 +322,15 @@ export default function AdminDashboard() {
       }
       if (data?.failed?.length > 0) {
         // Some rows in the batch succeeded and some didn't (e.g. another
-        // admin already decided one) — surface it instead of pretending
-        // the whole batch went through.
+        // admin already decided one) — name exactly which students failed
+        // (by looking their id up in the currently-loaded list) instead of
+        // just a count, so the admin doesn't have to re-scan the whole
+        // table for whichever ones are still pending_review.
+        const failedNames = (data.failed as { id: string; error?: string }[])
+          .map((f) => applications.find((a) => a.id === f.id)?.user.fullName ?? f.id)
+          .join(', ');
         setDecisionError(
-          `${data.failed.length} өтінім өзгертілмеді (${data.failed[0]?.error ?? 'қате'}). ${data.succeeded} өтінім сәтті өзгертілді.`,
+          `${data.failed.length} өтінім өзгертілмеді: ${failedNames} (${data.failed[0]?.error ?? 'қате'}). ${data.succeeded} өтінім сәтті өзгертілді.`,
         );
         load();
         loadStats();
@@ -223,12 +338,42 @@ export default function AdminDashboard() {
       }
       setPendingDecision(null);
       setDecisionNote('');
+      setDecisionLimitMonths('');
       load();
       loadStats();
     } catch {
       setDecisionError('Желі қатесі. Қайта көріңіз.');
     } finally {
       setDeciding(false);
+    }
+  }
+
+  async function handleImportFile(file: File) {
+    setImporting(true);
+    setImportError(null);
+    setImportResult(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/admin/import-activations', { method: 'POST', body: formData });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error ?? 'Қате шықты');
+      setImportResult(data.summary);
+      load();
+    } catch (e) {
+      setImportError(e instanceof Error ? e.message : 'Қате шықты. Қайта көріңіз.');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function resolveDispute(id: string) {
+    setResolvingDisputeId(id);
+    try {
+      const res = await fetch(`/api/admin/applications/${id}/resolve-activation-dispute`, { method: 'POST' });
+      if (res.ok) load();
+    } finally {
+      setResolvingDisputeId(null);
     }
   }
 
@@ -241,14 +386,15 @@ export default function AdminDashboard() {
     }
   }
 
-  function exportUrl(format: 'xlsx' | 'json') {
-    const [yyyy, mm, dd] = exportDate.split('-');
-    const params = new URLSearchParams({ date: `${dd}.${mm}.${yyyy}`, format });
+  function exportUrl(format: 'xlsx' | 'pf') {
+    const params = new URLSearchParams({ format });
+    if (exportDateFrom) params.set('dateFrom', exportDateFrom);
+    if (exportDateTo) params.set('dateTo', exportDateTo);
     if (exportStatus) params.set('status', exportStatus);
     return `/api/admin/export?${params.toString()}`;
   }
 
-  const activeFilterCount = [benefitType, email, date].filter(Boolean).length;
+  const activeFilterCount = [benefitType, email, dateFrom, dateTo].filter(Boolean).length;
   const totalCount = Object.values(stats).reduce((sum, n) => sum + n, 0);
 
   return (
@@ -287,6 +433,14 @@ export default function AdminDashboard() {
         >
           Аналитика
         </button>
+        <button
+          className={`flex-1 rounded-xl px-4 py-2.5 text-sm font-bold transition ${
+            page === 'statistics' ? 'bg-forest-900 text-paper-soft' : 'text-ink-soft hover:bg-forest-50'
+          }`}
+          onClick={() => setPage('statistics')}
+        >
+          Статистика
+        </button>
       </div>
 
       {/* Stays mounted (just hidden) rather than conditionally rendered, so
@@ -295,12 +449,20 @@ export default function AdminDashboard() {
       <div className={page === 'analytics' ? undefined : 'hidden'}>
         <AnalyticsSection usage={usage} />
       </div>
+      <div className={page === 'statistics' ? undefined : 'hidden'}>
+        <StatisticsSection />
+      </div>
 
       {page === 'applications' && (
         <>
-      {/* Stats overview */}
-      <div className="animate-scale-in mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {/* Stats overview — all 5 statuses shown so "Барлығы" always equals
+          the sum of the other cards; before this, drafts (started but not
+          yet submitted) counted toward the total with no card of their
+          own, so admins would see e.g. 15 total / 13 approved / 0 / 0 and
+          have no way to tell where the other 2 went. */}
+      <div className="animate-scale-in mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
         <StatCard label="Барлығы" value={totalCount} tone="bg-forest-900/5 text-forest-900" />
+        <StatCard label={STATUS_LABELS.draft} value={stats.draft ?? 0} tone="bg-paper-card text-ink-soft border border-forest-900/8" />
         <StatCard
           label={STATUS_LABELS.pending_review}
           value={stats.pending_review ?? 0}
@@ -310,13 +472,24 @@ export default function AdminDashboard() {
         <StatCard label={STATUS_LABELS.rejected} value={stats.rejected ?? 0} tone="bg-clay-400/15 text-clay-500" />
       </div>
 
-      {/* Export: pick a date, then download */}
+      {/* Export: optional date+time range, then download. Either end can
+          be left blank (open-ended before/since); leaving both blank
+          exports everything. */}
       <div className="animate-scale-in mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft">
-        <span className="text-sm font-semibold text-ink-soft">Экспорт күні:</span>
+        <span className="text-sm font-semibold text-ink-soft">Экспорт кезеңі:</span>
         <input
-          type="date"
-          value={exportDate}
-          onChange={(e) => setExportDate(e.target.value)}
+          type="datetime-local"
+          value={exportDateFrom}
+          onChange={(e) => setExportDateFrom(e.target.value)}
+          aria-label="Бастап"
+          className={selectClass}
+        />
+        <span className="text-sm text-ink-faint">—</span>
+        <input
+          type="datetime-local"
+          value={exportDateTo}
+          onChange={(e) => setExportDateTo(e.target.value)}
+          aria-label="Дейін"
           className={selectClass}
         />
         <select
@@ -332,11 +505,62 @@ export default function AdminDashboard() {
           ))}
         </select>
         <a className="btn-secondary" href={exportUrl('xlsx')}>
-          Excel
+          Excel FULL
         </a>
-        <a className="btn-secondary" href={exportUrl('json')}>
-          JSON
+        <a className="btn-secondary" href={exportUrl('pf')}>
+          Excel ПФ
         </a>
+      </div>
+
+      {/* Activation import: the admin sends "Excel ПФ" out to Kaspi/the
+          school's billing system, and once it confirms which students'
+          discounts actually went live, re-uploads that same shape here —
+          matched back to applications purely by email (activateDiscount.ts).
+          This is the only place discountActivatedAt ever gets set. */}
+      <div className="animate-scale-in mb-4 flex flex-col gap-3 rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="text-sm font-semibold text-ink-soft">
+            Белсендіру импорты (Excel ПФ):
+          </span>
+          <label className="btn-secondary cursor-pointer">
+            {importing ? 'Жүктелуде...' : 'Файл таңдау'}
+            <input
+              type="file"
+              accept=".xlsx"
+              disabled={importing}
+              className="sr-only"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                if (file) handleImportFile(file);
+              }}
+            />
+          </label>
+        </div>
+        {importError && (
+          <p className="rounded-xl bg-clay-400/10 px-3.5 py-2.5 text-sm font-medium text-clay-500">{importError}</p>
+        )}
+        {importResult && (
+          <div className="flex flex-wrap gap-2 text-xs font-semibold">
+            <span className="rounded-full bg-forest-100 px-2.5 py-1 text-forest-700">
+              Белсендірілді: {importResult.activated.length}
+            </span>
+            <span className="rounded-full bg-forest-900/5 px-2.5 py-1 text-ink-soft">
+              Бұрын белсендірілген: {importResult.alreadyActivated.length}
+            </span>
+            <span className="rounded-full bg-gold-100 px-2.5 py-1 text-gold-600">
+              Мақұлданған өтінімі жоқ: {importResult.noApprovedApplication.length}
+            </span>
+            <span className="rounded-full bg-clay-400/15 px-2.5 py-1 text-clay-500">
+              Табылмады: {importResult.notFound.length}
+            </span>
+            {importResult.invalid.length > 0 && (
+              <span className="rounded-full bg-clay-400/15 px-2.5 py-1 text-clay-500">
+                Жарамсыз email: {importResult.invalid.length}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Status tabs — pending_review is the actionable queue; the rest is history. */}
@@ -396,7 +620,23 @@ export default function AdminDashboard() {
             onChange={(e) => setEmail(e.target.value)}
             className={selectClass}
           />
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={selectClass} />
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="datetime-local"
+              value={dateFrom}
+              onChange={(e) => setDateFrom(e.target.value)}
+              aria-label="Бастап"
+              className={selectClass}
+            />
+            <span className="text-sm text-ink-faint">—</span>
+            <input
+              type="datetime-local"
+              value={dateTo}
+              onChange={(e) => setDateTo(e.target.value)}
+              aria-label="Дейін"
+              className={selectClass}
+            />
+          </div>
           <button type="submit" className="btn-secondary">
             Іздеу
           </button>
@@ -410,17 +650,13 @@ export default function AdminDashboard() {
           <div className="flex gap-2">
             <button
               className="rounded-full bg-forest-600 px-4 py-2 text-sm font-semibold text-paper-soft transition hover:bg-forest-700"
-              onClick={() =>
-                setPendingDecision({ ids: [...selected], label: `${selected.size} өтінім`, decision: 'approve' })
-              }
+              onClick={() => openDecision([...selected], `${selected.size} өтінім`, 'approve')}
             >
               Барлығын мақұлдау
             </button>
             <button
               className="rounded-full bg-clay-400/15 px-4 py-2 text-sm font-semibold text-clay-500 transition hover:bg-clay-400/25"
-              onClick={() =>
-                setPendingDecision({ ids: [...selected], label: `${selected.size} өтінім`, decision: 'reject' })
-              }
+              onClick={() => openDecision([...selected], `${selected.size} өтінім`, 'reject')}
             >
               Барлығын қабылдамау
             </button>
@@ -500,11 +736,30 @@ export default function AdminDashboard() {
                     <Icon name="alert" className="h-3.5 w-3.5" /> {rejectionReasonLabel(a)}
                   </p>
                 )}
+                {activationBadge(a) && (
+                  <p
+                    className={`mb-2 inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-bold ${activationBadge(a)!.tone}`}
+                  >
+                    {activationBadge(a)!.label}
+                    {a.activationDisputedAt && (
+                      <button
+                        className="underline decoration-2 underline-offset-2 disabled:opacity-50"
+                        disabled={resolvingDisputeId === a.id}
+                        onClick={() => resolveDispute(a.id)}
+                      >
+                        Шешілді
+                      </button>
+                    )}
+                  </p>
+                )}
                 <p className="mb-1 text-sm text-ink">
                   {a.benefitTypes.map((t) => BENEFIT_LABELS[t]).join(', ') || '—'}
                 </p>
                 <p className="mb-3 text-xs text-ink-faint">
                   {a.status === 'rejected' ? 'Жеңілдік берілмеді' : `${discountPercentFor(a.benefitTypes)}% жеңілдік`}
+                  {a.status === 'pending_review' &&
+                    suggestedLimitMonths(a.documents) !== null &&
+                    ` · ұсынылатын лимит: ${suggestedLimitMonths(a.documents)} ай`}
                 </p>
                 {a.documents.length > 0 && (
                   <div className="mb-3 flex flex-col gap-1">
@@ -518,6 +773,11 @@ export default function AdminDashboard() {
                         >
                           {d.originalFilename}
                         </a>
+                        {d.documentExpiryDate && (
+                          <span className="shrink-0 text-xs text-ink-faint">
+                            · {formatAlmatyDate(new Date(d.documentExpiryDate))} дейін
+                          </span>
+                        )}
                         {d.nameMatchesProfile === false && (
                           <span title="Құжаттағы аты-жөні профильмен сәйкес келмейді" className="shrink-0">
                             <Icon name="alert" className="h-3 w-3 text-clay-500" />
@@ -539,14 +799,8 @@ export default function AdminDashboard() {
                 {expandedId === a.id && <EventTimeline events={a.events} />}
                 {a.status === 'pending_review' && (
                   <div className="flex gap-2 border-t border-forest-900/8 pt-3">
-                    <ActionButton
-                      tone="approve"
-                      onClick={() => setPendingDecision({ ids: [a.id], label: a.user.fullName, decision: 'approve' })}
-                    />
-                    <ActionButton
-                      tone="reject"
-                      onClick={() => setPendingDecision({ ids: [a.id], label: a.user.fullName, decision: 'reject' })}
-                    />
+                    <ActionButton tone="approve" onClick={() => openDecision([a.id], a.user.fullName, 'approve')} />
+                    <ActionButton tone="reject" onClick={() => openDecision([a.id], a.user.fullName, 'reject')} />
                   </div>
                 )}
               </li>
@@ -607,31 +861,42 @@ export default function AdminDashboard() {
                       </td>
                       <td className={`px-2 py-3 font-medium ${a.status === 'rejected' ? 'text-ink-faint' : 'text-gold-600'}`}>
                         {a.status === 'rejected' ? '—' : `${discountPercentFor(a.benefitTypes)}%`}
+                        {a.status === 'pending_review' && suggestedLimitMonths(a.documents) !== null && (
+                          <span className="block text-[11px] font-normal text-ink-faint">
+                            {suggestedLimitMonths(a.documents)} ай
+                          </span>
+                        )}
                       </td>
                       <td className="max-w-[160px] px-2 py-3">
                         {a.documents.length === 0 ? (
                           <span className="text-ink-faint">—</span>
                         ) : (
-                          <div className="flex flex-col gap-0.5">
+                          <div className="flex flex-col gap-1.5">
                             {a.documents.map((d) => (
-                              <a
-                                key={d.id}
-                                className={`block truncate underline decoration-2 underline-offset-2 ${
-                                  d.nameMatchesProfile === false
-                                    ? 'text-clay-500 decoration-clay-400 hover:text-clay-600'
-                                    : 'text-forest-700 decoration-forest-300 hover:text-forest-900'
-                                }`}
-                                href={`/api/documents/${d.id}/file`}
-                                target="_blank"
-                                rel="noreferrer"
-                                title={
-                                  d.nameMatchesProfile === false
-                                    ? `${d.originalFilename} — аты-жөні профильмен сәйкес келмейді`
-                                    : d.originalFilename
-                                }
-                              >
-                                {d.originalFilename}
-                              </a>
+                              <div key={d.id}>
+                                <a
+                                  className={`block truncate underline decoration-2 underline-offset-2 ${
+                                    d.nameMatchesProfile === false
+                                      ? 'text-clay-500 decoration-clay-400 hover:text-clay-600'
+                                      : 'text-forest-700 decoration-forest-300 hover:text-forest-900'
+                                  }`}
+                                  href={`/api/documents/${d.id}/file`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  title={
+                                    d.nameMatchesProfile === false
+                                      ? `${d.originalFilename} — аты-жөні профильмен сәйкес келмейді`
+                                      : d.originalFilename
+                                  }
+                                >
+                                  {d.originalFilename}
+                                </a>
+                                {d.documentExpiryDate && (
+                                  <span className="block text-[11px] text-ink-faint">
+                                    {formatAlmatyDate(new Date(d.documentExpiryDate))} дейін
+                                  </span>
+                                )}
+                              </div>
                             ))}
                           </div>
                         )}
@@ -644,6 +909,22 @@ export default function AdminDashboard() {
                         {rejectionReasonLabel(a) && (
                           <p className="mt-1 inline-flex items-center gap-1 rounded-full bg-clay-400/15 px-2 py-0.5 text-[11px] font-bold text-clay-500">
                             <Icon name="alert" className="h-3.5 w-3.5" /> {rejectionReasonLabel(a)}
+                          </p>
+                        )}
+                        {activationBadge(a) && (
+                          <p
+                            className={`mt-1 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-bold ${activationBadge(a)!.tone}`}
+                          >
+                            {activationBadge(a)!.label}
+                            {a.activationDisputedAt && (
+                              <button
+                                className="underline decoration-2 underline-offset-2 disabled:opacity-50"
+                                disabled={resolvingDisputeId === a.id}
+                                onClick={() => resolveDispute(a.id)}
+                              >
+                                Шешілді
+                              </button>
+                            )}
                           </p>
                         )}
                       </td>
@@ -663,15 +944,11 @@ export default function AdminDashboard() {
                           <div className="flex gap-2">
                             <ActionButton
                               tone="approve"
-                              onClick={() =>
-                                setPendingDecision({ ids: [a.id], label: a.user.fullName, decision: 'approve' })
-                              }
+                              onClick={() => openDecision([a.id], a.user.fullName, 'approve')}
                             />
                             <ActionButton
                               tone="reject"
-                              onClick={() =>
-                                setPendingDecision({ ids: [a.id], label: a.user.fullName, decision: 'reject' })
-                              }
+                              onClick={() => openDecision([a.id], a.user.fullName, 'reject')}
                             />
                           </div>
                         ) : (
@@ -699,7 +976,10 @@ export default function AdminDashboard() {
       {pendingDecision && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-forest-950/40 p-4 backdrop-blur-sm"
-          onClick={() => !deciding && (setPendingDecision(null), setDecisionNote(''), setDecisionError(null))}
+          onClick={() =>
+            !deciding &&
+            (setPendingDecision(null), setDecisionNote(''), setDecisionLimitMonths(''), setDecisionError(null))
+          }
         >
           <div
             className="animate-scale-in w-full max-w-sm rounded-2xl bg-paper-card p-6 shadow-lifted"
@@ -714,6 +994,32 @@ export default function AdminDashboard() {
                 ? ' Жеңілдік беріледі.'
                 : ' Жеңілдік берілмейді, құжаттар жойылады.'}
             </p>
+            {pendingDecision.decision === 'approve' && (
+              <label className="mb-4 block">
+                <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-ink-faint">
+                  Жеңілдік лимиті (ай) *
+                </span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={60}
+                  step={1}
+                  value={decisionLimitMonths}
+                  onChange={(e) => setDecisionLimitMonths(e.target.value)}
+                  className="w-full rounded-xl border border-forest-900/12 bg-paper-soft px-3.5 py-2.5 text-sm text-ink outline-none transition focus:border-forest-500 focus:ring-2 focus:ring-forest-500/15"
+                  placeholder="Мысалы: 12"
+                />
+                <span className="mt-1 block text-xs text-ink-faint">
+                  Жеңілдік неше айға берілетінін көрсетіңіз (1–60) — қажет болса өзгертіңіз.
+                </span>
+                {approveLimitHint(pendingDecision.ids) && (
+                  <span className="mt-1 block text-xs font-medium text-forest-700">
+                    {approveLimitHint(pendingDecision.ids)}
+                  </span>
+                )}
+              </label>
+            )}
             <label className="mb-6 block">
               <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-ink-faint">
                 Түсініктеме (міндетті емес)
@@ -739,6 +1045,7 @@ export default function AdminDashboard() {
                 onClick={() => {
                   setPendingDecision(null);
                   setDecisionNote('');
+                  setDecisionLimitMonths('');
                   setDecisionError(null);
                 }}
               >
@@ -750,7 +1057,15 @@ export default function AdminDashboard() {
                     ? 'bg-forest-700 hover:bg-forest-800'
                     : 'bg-clay-500 hover:bg-clay-500/90'
                 }`}
-                disabled={deciding}
+                disabled={
+                  deciding ||
+                  (pendingDecision.decision === 'approve' &&
+                    !(
+                      Number.isInteger(Number(decisionLimitMonths)) &&
+                      Number(decisionLimitMonths) >= 1 &&
+                      Number(decisionLimitMonths) <= 60
+                    ))
+                }
                 onClick={confirmDecision}
               >
                 {deciding ? '...' : 'Растау'}
@@ -763,11 +1078,106 @@ export default function AdminDashboard() {
   );
 }
 
-function StatCard({ label, value, tone }: { label: string; value: number | string; tone: string }) {
+function StatCard({
+  label,
+  value,
+  tone,
+  icon,
+  trend,
+}: {
+  label: string;
+  value: number | string;
+  tone: string;
+  // Purely decorative context (which metric family this is), never the
+  // only way to identify the card — the label text already does that.
+  icon?: Parameters<typeof Icon>[0]['name'];
+  // 12-point-ish trend per the stat-tile contract (marks-and-anatomy.md):
+  // de-emphasis hue with the current period picked out in the accent.
+  trend?: number[];
+}) {
   return (
-    <div className={`rounded-2xl px-4 py-3.5 shadow-soft ${tone}`}>
-      <p className="font-display text-2xl font-semibold">{value}</p>
+    <div className={`relative overflow-hidden rounded-2xl px-4 py-3.5 shadow-soft ${tone}`}>
+      <div className="flex items-start justify-between gap-2">
+        <p className="font-display text-2xl font-semibold">{value}</p>
+        {icon && (
+          <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-black/5">
+            <Icon name={icon} className="h-3.5 w-3.5 opacity-70" />
+          </span>
+        )}
+      </div>
       <p className="text-xs font-semibold opacity-80">{label}</p>
+      {trend && trend.length >= 2 && (
+        <div className="mt-2 h-6">
+          <Sparkline values={trend} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Trend-only, axis-free — the stat tile's value already carries the exact
+// number, so this only has to communicate "shape": is it rising, flat, or
+// choppy. De-emphasis gray for the path, with the final (current) point
+// picked out in the tile's own text color so it reads as "you are here"
+// without introducing a second hue.
+function Sparkline({ values }: { values: number[] }) {
+  // `values.length - 1` in the x formula below divides by zero for a
+  // single point. Every current caller already checks `trend.length >= 2`
+  // before rendering this, but that guard living only on the caller side
+  // is fragile — keep one here too so the component is safe on its own.
+  if (values.length < 2) return null;
+  const w = 100;
+  const h = 24;
+  const max = Math.max(...values, 0.0001);
+  const min = Math.min(...values, 0);
+  const range = max - min || 1;
+  const points = values.map((v, i) => ({
+    x: (i / (values.length - 1)) * w,
+    y: h - ((v - min) / range) * (h - 4) - 2,
+  }));
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const last = points[points.length - 1]!;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="h-full w-full overflow-visible" preserveAspectRatio="none">
+      <path d={path} fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" opacity={0.45} vectorEffect="non-scaling-stroke" />
+      <circle cx={last.x} cy={last.y} r={2} fill="currentColor" />
+    </svg>
+  );
+}
+
+// "A single ratio against a limit -> Meter (same-ramp track)" — the
+// dataviz skill's explicit alternative to a pie for exactly this shape of
+// number (approval rate). Track is a lighter step of the same hue as the
+// fill so the state reads across the whole bar, not just the filled part.
+function Meter({
+  label,
+  percent,
+  fillClassName = 'bg-forest-600',
+  trackClassName = 'bg-forest-100',
+}: {
+  label: string;
+  percent: number | null;
+  fillClassName?: string;
+  trackClassName?: string;
+}) {
+  const clamped = percent === null ? 0 : Math.max(0, Math.min(100, percent));
+  return (
+    <div className="rounded-2xl border border-forest-900/8 bg-paper-card px-4 py-3.5 shadow-soft">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <p className="text-xs font-semibold text-ink-faint">{label}</p>
+        <p className="font-display text-lg font-semibold text-ink">{percent !== null ? `${percent.toFixed(0)}%` : '—'}</p>
+      </div>
+      {/* No data (nothing decided yet in this period) reads as a plain
+          neutral track, not the same-ramp color — a colored empty track
+          would look like "some" progress when there's genuinely none. */}
+      <div className={`h-2.5 w-full overflow-hidden rounded-full ${percent === null ? 'bg-forest-900/6' : trackClassName}`}>
+        {percent !== null && (
+          <div
+            className={`h-full rounded-full transition-all duration-700 ease-out ${fillClassName}`}
+            style={{ width: `${clamped}%` }}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -864,7 +1274,12 @@ function AnalyticsSection({ usage }: { usage: AiUsage | null }) {
   const [granularity, setGranularity] = useState<Granularity>('day');
   const [metric, setMetric] = useState<Metric>('costUsd');
   const [series, setSeries] = useState<TimeseriesPoint[]>([]);
-  const [seriesLoading, setSeriesLoading] = useState(false);
+  // Starts true — the fetch effect below only flips it on its own first
+  // run, one render after mount, so a `false` default would let the very
+  // first paint fall through to the "no data" empty state before the
+  // request even started (a wrong-empty-state flash, not the intended
+  // "hold the frame" skeleton).
+  const [seriesLoading, setSeriesLoading] = useState(true);
 
   useEffect(() => {
     setSeriesLoading(true);
@@ -885,13 +1300,14 @@ function AnalyticsSection({ usage }: { usage: AiUsage | null }) {
     <div className="animate-scale-in flex flex-col gap-4">
       {usage && (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <StatCard label="Барлық шығын" value={formatUsd(usage.totals.costUsd)} tone="bg-forest-900/5 text-forest-900" />
-          <StatCard label="Соңғы 30 күн" value={formatUsd(usage.last30Days.costUsd)} tone="bg-forest-100 text-forest-700" />
-          <StatCard label="Барлық шақыру" value={formatCount(usage.totals.calls)} tone="bg-gold-100 text-gold-600" />
+          <StatCard label="Барлық шығын" value={formatUsd(usage.totals.costUsd)} tone="bg-forest-900/5 text-forest-900" icon="zap" />
+          <StatCard label="Соңғы 30 күн" value={formatUsd(usage.last30Days.costUsd)} tone="bg-forest-100 text-forest-700" icon="hourglass" />
+          <StatCard label="Барлық шақыру" value={formatCount(usage.totals.calls)} tone="bg-gold-100 text-gold-600" icon="sparkle" />
           <StatCard
             label="Өтінімге орташа"
             value={usage.avgCostPerApplication !== null ? formatUsd(usage.avgCostPerApplication) : '—'}
             tone="bg-paper-card text-ink border border-forest-900/8"
+            icon="check-circle"
           />
         </div>
       )}
@@ -936,45 +1352,67 @@ function AnalyticsSection({ usage }: { usage: AiUsage | null }) {
           </div>
         </div>
 
-        {seriesLoading ? (
+        {/* First load only shows the skeleton — a granularity/metric
+            switch afterward holds the previous render at reduced opacity
+            instead of flashing blank (interaction.md: "refetch keeps the
+            frame"). */}
+        {series.length === 0 && seriesLoading ? (
           <div className="h-56 animate-pulse rounded-xl bg-forest-900/5" />
         ) : series.length === 0 ? (
           <p className="py-12 text-center text-sm text-ink-faint">Бұл кезеңде деректер жоқ.</p>
         ) : (
-          <TimeseriesChart series={series} metric={metric} granularity={granularity} />
+          <div className={`transition-opacity duration-200 ${seriesLoading ? 'opacity-40' : 'opacity-100'}`}>
+            <TimeseriesChart series={series} metric={metric} granularity={granularity} />
+          </div>
         )}
       </div>
 
       {usage && (
         <div className="grid gap-4 rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft sm:grid-cols-2 sm:p-6">
-          <div>
-            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-faint">Модель бойынша</p>
-            <ul className="flex flex-col gap-1.5">
-              {usage.byModel.map((m) => (
-                <li key={m.model} className="flex items-center justify-between gap-2 text-sm">
-                  <span className="truncate text-ink">{m.model}</span>
-                  <span className="shrink-0 text-ink-faint">
-                    {formatCount(m.calls)} · {formatUsd(m.costUsd)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div>
-            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-faint">Түрі бойынша</p>
-            <ul className="flex flex-col gap-1.5">
-              {usage.byKind.map((k) => (
-                <li key={k.kind} className="flex items-center justify-between gap-2 text-sm">
-                  <span className="truncate text-ink">{KIND_LABELS[k.kind] ?? k.kind}</span>
-                  <span className="shrink-0 text-ink-faint">
-                    {formatCount(k.calls)} · {formatUsd(k.costUsd)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
+          <MagnitudeBreakdown title="Модель бойынша" rows={usage.byModel.map((m) => ({ key: m.model, label: m.model, calls: m.calls, costUsd: m.costUsd }))} />
+          <MagnitudeBreakdown
+            title="Түрі бойынша"
+            rows={usage.byKind.map((k) => ({ key: k.kind, label: KIND_LABELS[k.kind] ?? k.kind, calls: k.calls, costUsd: k.costUsd }))}
+          />
         </div>
       )}
+    </div>
+  );
+}
+
+// "Compare magnitude" over nominal categories (model/document-type names) —
+// one flat hue for every bar, length carries the comparison. Coloring bars
+// darker-where-bigger here would double-encode length as hue and fail the
+// categorical checks by design (anti-patterns.md), so every bar shares the
+// same sequential-blue tone; only its length differs.
+function MagnitudeBreakdown({
+  title,
+  rows,
+}: {
+  title: string;
+  rows: { key: string; label: string; calls: number; costUsd: number }[];
+}) {
+  const max = Math.max(...rows.map((r) => r.costUsd), 0.0001);
+  return (
+    <div>
+      <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-faint">{title}</p>
+      <ul className="flex flex-col gap-2.5">
+        {rows.map((r) => (
+          <li key={r.key}>
+            <div className="mb-1 flex items-baseline justify-between gap-2 text-sm">
+              <span className="truncate text-ink">{r.label}</span>
+              <span className="shrink-0 font-semibold text-ink">{formatUsd(r.costUsd)}</span>
+            </div>
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-forest-900/5">
+              <div
+                className="h-full rounded-full transition-all duration-500"
+                style={{ width: `${(r.costUsd / max) * 100}%`, background: SEQ_LINE }}
+              />
+            </div>
+            <p className="mt-0.5 text-[11px] text-ink-faint">{formatCount(r.calls)} шақыру</p>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -985,6 +1423,17 @@ const CHART_PAD_LEFT = 44;
 const CHART_PAD_BOTTOM = 24;
 const CHART_PAD_TOP = 12;
 
+// Trend-over-time, one series -> line + soft area wash, per
+// choosing-a-form.md ("Trend over time -> line; area for a single series",
+// color job "sequential or 1 categorical"). SEQ_LINE/SEQ_AREA below are the
+// dataviz skill's own reference sequential-blue ramp (palette.md step
+// 450/mid-tone for the stroke, same hue at the documented ~10% area-fill
+// wash) — a different hue from this app's own teal/gold brand on purpose,
+// matching how STATUS_CHART_COLORS/BENEFIT_CHART_COLORS already borrow
+// validated chart hues while the surrounding chrome stays on-brand.
+const SEQ_LINE = '#2a78d6';
+const SEQ_AREA = 'rgba(42,120,214,0.12)';
+
 function TimeseriesChart({
   series,
   metric,
@@ -994,42 +1443,87 @@ function TimeseriesChart({
   metric: Metric;
   granularity: Granularity;
 }) {
-  const [hovered, setHovered] = useState<number | null>(null);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
 
   const values = series.map((p) => (metric === 'costUsd' ? p.costUsd : metric === 'totalTokens' ? p.totalTokens : p.calls));
-  const maxValue = Math.max(...values, 1);
+  // A hard floor of 1 here would flatten a real chart to invisible for
+  // costUsd, whose values are routinely fractions of a cent — the axis
+  // would scale 0..$1 against data that never leaves $0..$0.01. Only fall
+  // back at all to keep the scale finite when every value is truly zero.
+  const maxValue = Math.max(...values, 0.0001);
 
   const plotWidth = CHART_WIDTH - CHART_PAD_LEFT;
   const plotHeight = CHART_HEIGHT - CHART_PAD_TOP - CHART_PAD_BOTTOM;
-  const barGap = 3;
-  // Capped so a handful of bars (e.g. one month of "month" granularity)
-  // don't stretch into one giant block spanning the whole plot — the
-  // leftover space is then centered rather than left bar-hugging the axis.
-  const barWidth = Math.min(48, Math.max(2, plotWidth / series.length - barGap));
-  const rowWidth = series.length * (barWidth + barGap) - barGap;
-  const rowOffset = Math.max(0, (plotWidth - rowWidth) / 2);
+  const baselineY = CHART_PAD_TOP + plotHeight;
+  // Single points still need somewhere to put the one mark — center it.
+  const xFor = (i: number) => (series.length <= 1 ? CHART_PAD_LEFT + plotWidth / 2 : CHART_PAD_LEFT + (i / (series.length - 1)) * plotWidth);
+  const yFor = (v: number) => baselineY - (maxValue > 0 ? (v / maxValue) * plotHeight : 0);
 
-  // Avoid label collisions when there are many bars — show at most ~8 x-axis labels.
-  const labelStride = Math.max(1, Math.ceil(series.length / 8));
+  const points = values.map((v, i) => ({ x: xFor(i), y: yFor(v) }));
+  const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const areaPath = points.length
+    ? `${linePath} L${points[points.length - 1]!.x.toFixed(1)},${baselineY} L${points[0]!.x.toFixed(1)},${baselineY} Z`
+    : '';
 
+  const labelStride = Math.max(1, Math.ceil(series.length / 7));
   const gridLines = [0, 0.25, 0.5, 0.75, 1];
+  const last = points[points.length - 1];
+
+  function handleMove(e: React.PointerEvent<SVGSVGElement>) {
+    const svg = svgRef.current;
+    if (!svg || series.length === 0) return;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = CHART_WIDTH / rect.width;
+    const localX = (e.clientX - rect.left) * scaleX;
+    // Nearest-point rather than exact hit — "the crosshair finds the X",
+    // the reader aims at a period, never at a 2px line (interaction.md).
+    let closest = 0;
+    let bestDist = Infinity;
+    points.forEach((p, i) => {
+      const dist = Math.abs(p.x - localX);
+      if (dist < bestDist) {
+        bestDist = dist;
+        closest = i;
+      }
+    });
+    setHoverIndex(closest);
+  }
+
+  const hovered = hoverIndex !== null ? series[hoverIndex] : null;
+  const hoveredPoint = hoverIndex !== null ? points[hoverIndex] : null;
+
+  // Arrow-left/right steps the same crosshair a keyboard user would get
+  // from the mouse — "same details on keyboard focus as on hover"
+  // (interaction.md). Focusing the plot for the first time (Tab into it)
+  // starts on the last/most-recent point, mirroring the always-visible
+  // endpoint marker shown when nothing is hovered.
+  function handleKeyDown(e: React.KeyboardEvent<SVGRectElement>) {
+    if (series.length === 0) return;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      setHoverIndex((h) => Math.max(0, (h ?? series.length - 1) - 1));
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      setHoverIndex((h) => Math.min(series.length - 1, (h ?? series.length - 1) + 1));
+    }
+  }
 
   return (
     <div className="relative">
-      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full" style={{ height: 'auto' }}>
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+        className="w-full touch-none"
+        style={{ height: 'auto' }}
+        onPointerMove={handleMove}
+        onPointerLeave={() => setHoverIndex(null)}
+      >
         {gridLines.map((f) => {
           const y = CHART_PAD_TOP + plotHeight * (1 - f);
           return (
             <g key={f}>
-              <line
-                x1={CHART_PAD_LEFT}
-                x2={CHART_WIDTH}
-                y1={y}
-                y2={y}
-                stroke="currentColor"
-                className="text-forest-900/8"
-                strokeWidth={1}
-              />
+              <line x1={CHART_PAD_LEFT} x2={CHART_WIDTH} y1={y} y2={y} stroke="currentColor" className="text-forest-900/8" strokeWidth={1} />
               <text x={0} y={y + 3} fontSize={9} className="fill-ink-faint">
                 {formatAxisValue(maxValue * f, metric)}
               </text>
@@ -1037,50 +1531,104 @@ function TimeseriesChart({
           );
         })}
 
+        {areaPath && <path d={areaPath} fill={SEQ_AREA} className="animate-fade-up" style={{ animationDuration: '0.5s' }} />}
+        {linePath && (
+          <path
+            d={linePath}
+            fill="none"
+            stroke={SEQ_LINE}
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="animate-fade-up"
+            style={{ animationDuration: '0.5s' }}
+          />
+        )}
+
         {series.map((p, i) => {
-          const value = values[i]!;
-          const barHeight = maxValue > 0 ? (value / maxValue) * plotHeight : 0;
-          const x = CHART_PAD_LEFT + rowOffset + i * (barWidth + barGap);
-          const y = CHART_PAD_TOP + plotHeight - barHeight;
-          const showLabel = i % labelStride === 0;
+          const showLabel = i % labelStride === 0 || i === series.length - 1;
+          if (!showLabel) return null;
+          const px = xFor(i);
+          // A centered label on the last (rightmost) point overhangs the
+          // viewBox by half its width and gets clipped by the card edge —
+          // anchor it to its own right edge there instead, same fix
+          // already used for the value label just below.
+          const anchor = px > CHART_WIDTH - 40 ? 'end' : px < 40 ? 'start' : 'middle';
+          const labelX = anchor === 'end' ? Math.min(px + 20, CHART_WIDTH) : anchor === 'start' ? Math.max(px - 20, 0) : px;
           return (
-            <g key={p.period}>
-              <rect
-                x={x}
-                y={y}
-                width={barWidth}
-                height={Math.max(barHeight, 1)}
-                rx={Math.min(4, barWidth / 2)}
-                className={hovered === i ? 'fill-forest-700' : 'fill-forest-500'}
-                onMouseEnter={() => setHovered(i)}
-                onMouseLeave={() => setHovered((h) => (h === i ? null : h))}
-              >
-                <title>
-                  {formatPeriodLabel(p.period, granularity)}: {formatAxisValue(value, metric)}
-                </title>
-              </rect>
-              {showLabel && (
-                <text
-                  x={x + barWidth / 2}
-                  y={CHART_HEIGHT - 6}
-                  fontSize={9}
-                  textAnchor="middle"
-                  className="fill-ink-faint"
-                >
-                  {formatPeriodLabel(p.period, granularity)}
-                </text>
-              )}
-            </g>
+            <text key={p.period} x={labelX} y={CHART_HEIGHT - 6} fontSize={9} textAnchor={anchor} className="fill-ink-faint">
+              {formatPeriodLabel(p.period, granularity)}
+            </text>
           );
         })}
+
+        {/* Crosshair — a vertical hairline snapped to the nearest period,
+            plus a marker (>=8px, 2px surface ring) at the hovered point and
+            a permanent endpoint marker so the latest value is always
+            direct-labeled, not just on hover (marks-and-anatomy.md: "Lines
+            -> value at the end"). */}
+        {hoveredPoint && (
+          <line x1={hoveredPoint.x} x2={hoveredPoint.x} y1={CHART_PAD_TOP} y2={baselineY} stroke="currentColor" className="text-forest-900/20" strokeWidth={1} />
+        )}
+        {hoveredPoint && <circle cx={hoveredPoint.x} cy={hoveredPoint.y} r={5} fill={SEQ_LINE} className="stroke-paper-card" strokeWidth={2} />}
+        {last && hoverIndex === null && <circle cx={last.x} cy={last.y} r={4} fill={SEQ_LINE} className="stroke-paper-card" strokeWidth={2} />}
+        {last && (
+          <text
+            x={Math.min(last.x + 6, CHART_WIDTH - 4)}
+            // A point near the top of the plot (e.g. the single-point case
+            // — one bucket, so its value IS the max, sitting right at
+            // CHART_PAD_TOP) would push this label above the plot
+            // entirely, straight into the top gridline's own axis label.
+            // Drop it below the point instead once there's no room above.
+            y={last.y - 8 < CHART_PAD_TOP + 8 ? last.y + 16 : last.y - 8}
+            fontSize={10}
+            fontWeight={700}
+            textAnchor={last.x > CHART_WIDTH - 60 ? 'end' : 'start'}
+            className="fill-ink"
+          >
+            {formatAxisValue(values[values.length - 1]!, metric)}
+          </text>
+        )}
+
+        {/* Full-plot hit area for the crosshair — bars/cells hit their own
+            mark, but a line's hit target is the whole plot band. Also the
+            keyboard entry point: focusable, arrow keys step the crosshair,
+            aria-label speaks the currently-focused (or latest) point since
+            the visual tooltip is `pointer-events-none` and never itself
+            reachable by Tab. */}
+        <rect
+          x={CHART_PAD_LEFT}
+          y={0}
+          width={plotWidth}
+          height={CHART_HEIGHT}
+          fill="transparent"
+          tabIndex={0}
+          role="img"
+          aria-label={
+            hovered
+              ? `${formatPeriodLabel(hovered.period, granularity)}: ${formatUsd(hovered.costUsd)}, ${formatCount(hovered.totalTokens)} токен, ${formatCount(hovered.calls)} шақыру`
+              : last
+                ? `Соңғы период: ${formatAxisValue(values[values.length - 1]!, metric)}. Бағыттар пернесімен шолыңыз.`
+                : undefined
+          }
+          onFocus={() => setHoverIndex((h) => h ?? series.length - 1)}
+          onBlur={() => setHoverIndex(null)}
+          onKeyDown={handleKeyDown}
+        />
       </svg>
 
-      {hovered !== null && series[hovered] && (
-        <div className="pointer-events-none absolute -top-2 left-1/2 -translate-x-1/2 -translate-y-full rounded-lg bg-forest-950 px-3 py-2 text-xs font-semibold text-paper-soft shadow-lifted">
-          <p>{formatPeriodLabel(series[hovered]!.period, granularity)}</p>
-          <p className="text-paper-soft/80">
-            {formatUsd(series[hovered]!.costUsd)} · {formatCount(series[hovered]!.totalTokens)} токен ·{' '}
-            {formatCount(series[hovered]!.calls)} шақыру
+      {hovered && hoveredPoint && (
+        <div
+          className="pointer-events-none absolute -top-2 -translate-x-1/2 -translate-y-full rounded-lg bg-forest-950 px-3 py-2 text-xs shadow-lifted"
+          style={{ left: `${clampPct((hoveredPoint.x / CHART_WIDTH) * 100)}%` }}
+        >
+          <p className="mb-1 font-semibold text-paper-soft/70">{formatPeriodLabel(hovered.period, granularity)}</p>
+          <p className="flex items-center gap-1.5 text-paper-soft">
+            <span className="h-0.5 w-3 rounded-full" style={{ background: SEQ_LINE }} aria-hidden />
+            <span className="font-bold">{formatUsd(hovered.costUsd)}</span>
+            <span className="text-paper-soft/60">
+              · {formatCount(hovered.totalTokens)} токен · {formatCount(hovered.calls)} шақыру
+            </span>
           </p>
         </div>
       )}
@@ -1089,14 +1637,520 @@ function TimeseriesChart({
 }
 
 function formatAxisValue(value: number, metric: Metric): string {
-  if (metric === 'costUsd') return `$${value.toFixed(value < 1 ? 3 : 1)}`;
+  // Matches formatUsd's precision tiers — OCR calls cost fractions of a
+  // cent, so a gridline fraction of a tiny maxValue needs 4 decimals or it
+  // just rounds away to "$0.000" and the axis looks broken.
+  if (metric === 'costUsd') return `$${value.toFixed(value < 0.01 ? 4 : value < 1 ? 3 : 1)}`;
   return formatCount(Math.round(value));
+}
+
+// ---------- "Статистика" tab ----------
+
+type AppStatsSeries = {
+  period: string;
+  draft: number;
+  pending_review: number;
+  approved: number;
+  rejected: number;
+  total: number;
+};
+
+type AppStats = {
+  granularity: Granularity;
+  total: number;
+  statusCounts: Record<ApplicationStatus, number>;
+  approvalRate: number | null;
+  benefitTypeCounts: Record<string, number>;
+  series: AppStatsSeries[];
+};
+
+const STATUS_ORDER: ApplicationStatus[] = ['draft', 'pending_review', 'approved', 'rejected'];
+
+// Fixed status colors (not themed to the app's teal/gold brand) — these are
+// state indicators, not a categorical series, so they use the dataviz
+// skill's reserved status palette (good/warning/critical + a neutral for
+// "draft", which isn't really good or bad). The brand teal fails the
+// palette validator's chroma/lightness gates for use as a chart mark
+// (it's a deliberately desaturated hue), so chart marks borrow validated
+// hues while the surrounding cards/inputs stay in the app's own palette.
+const STATUS_CHART_COLORS: Record<ApplicationStatus, string> = {
+  draft: '#898781',
+  pending_review: '#fab219',
+  approved: '#0ca30c',
+  rejected: '#d03b3b',
+};
+
+// Categorical, validated all-pairs (safe for a small-multiple/legend
+// context, not just adjacent bars) — see dataviz skill reference palette,
+// slots 1-3.
+const BENEFIT_CHART_COLORS: Record<string, string> = {
+  many_children_family: '#2a78d6',
+  incomplete_family: '#eb6834',
+  disability: '#1baf7a',
+};
+
+function StatisticsSection() {
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [granularity, setGranularity] = useState<Granularity>('day');
+  const [stats, setStats] = useState<AppStats | null>(null);
+  // See the identical reasoning on AnalyticsSection's seriesLoading — a
+  // `false` default here lets the first paint show "no data" for one
+  // frame before the mount effect's `load()` call even starts.
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  function load() {
+    setLoading(true);
+    setError(null);
+    const params = new URLSearchParams({ granularity });
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    fetch(`/api/admin/statistics?${params.toString()}`)
+      .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) throw new Error(data?.error ?? 'Қате шықты');
+        setStats(data);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : 'Қате шықты. Қайта көріңіз.'))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    load();
+    // Granularity changes re-fetch automatically (like the AI-usage chart's
+    // toggle); the date range is applied explicitly via the "Қолдану"
+    // button below, so typing into the inputs doesn't spam requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [granularity]);
+
+  return (
+    <div className="animate-scale-in flex flex-col gap-4">
+      <div className="rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft sm:p-6">
+        <div className="mb-5 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold text-ink-soft">Кезең:</span>
+          <input
+            type="datetime-local"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            aria-label="Бастап"
+            className={selectClass}
+          />
+          <span className="text-sm text-ink-faint">—</span>
+          <input
+            type="datetime-local"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            aria-label="Дейін"
+            className={selectClass}
+          />
+          <button type="button" className="btn-secondary" disabled={loading} onClick={load}>
+            {loading ? '...' : 'Қолдану'}
+          </button>
+        </div>
+
+        {error && (
+          <p className="mb-4 rounded-xl bg-clay-400/10 px-4 py-3 text-sm font-medium text-clay-500">{error}</p>
+        )}
+
+        {stats && (
+          <>
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-faint">Таңдалған кезеңде</p>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+              <StatCard
+                label="Барлығы"
+                value={stats.total}
+                tone="bg-forest-900/5 text-forest-900"
+                trend={stats.series.map((s) => s.total)}
+              />
+              <StatCard
+                label={STATUS_LABELS.draft}
+                value={stats.statusCounts.draft}
+                tone="bg-paper-card text-ink-soft border border-forest-900/8"
+                icon="edit"
+                trend={stats.series.map((s) => s.draft)}
+              />
+              <StatCard
+                label={STATUS_LABELS.pending_review}
+                value={stats.statusCounts.pending_review}
+                tone="bg-gold-100 text-gold-600"
+                icon="search"
+                trend={stats.series.map((s) => s.pending_review)}
+              />
+              <StatCard
+                label={STATUS_LABELS.approved}
+                value={stats.statusCounts.approved}
+                tone="bg-forest-100 text-forest-700"
+                icon="check-circle"
+                trend={stats.series.map((s) => s.approved)}
+              />
+              <StatCard
+                label={STATUS_LABELS.rejected}
+                value={stats.statusCounts.rejected}
+                tone="bg-clay-400/15 text-clay-500"
+                icon="x-circle"
+                trend={stats.series.map((s) => s.rejected)}
+              />
+            </div>
+            <div className="mt-2">
+              <Meter label="Мақұлдау пайызы" percent={stats.approvalRate} fillClassName="bg-forest-600" trackClassName="bg-forest-100" />
+            </div>
+          </>
+        )}
+      </div>
+
+      {stats && stats.total > 0 && (
+        <div className="rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft sm:p-6">
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-faint">Өтінім жолы</p>
+          <p className="mb-4 text-[13px] text-ink-faint">Толтырудан шешімге дейінгі әр кезеңде қанша өтінім қалғанын көрсетеді.</p>
+          <ApplicationFunnel statusCounts={stats.statusCounts} />
+        </div>
+      )}
+
+      <div className="rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft sm:p-6">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-ink-faint">
+            Өтінімдер саны · {GRANULARITY_LABELS[granularity].toLowerCase()} бойынша
+          </p>
+          <div className="flex rounded-xl bg-forest-50 p-1">
+            {(Object.keys(GRANULARITY_LABELS) as Granularity[]).map((g) => (
+              <button
+                key={g}
+                onClick={() => setGranularity(g)}
+                className={`rounded-lg px-3 py-3 text-xs font-bold outline-none transition focus-visible:ring-2 focus-visible:ring-forest-500/40 ${
+                  granularity === g ? 'bg-forest-900 text-paper-soft' : 'text-ink-soft hover:text-ink'
+                }`}
+              >
+                {GRANULARITY_LABELS[g]}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Same "hold the frame" rule as the Analytics tab's chart — only
+            the very first load (no data yet) shows the skeleton. */}
+        {!stats && loading ? (
+          <div className="h-56 animate-pulse rounded-xl bg-forest-900/5" />
+        ) : !stats || stats.series.length === 0 ? (
+          <p className="py-12 text-center text-sm text-ink-faint">Бұл кезеңде деректер жоқ.</p>
+        ) : (
+          <div className={`transition-opacity duration-200 ${loading ? 'opacity-40' : 'opacity-100'}`}>
+            <StatusStackedChart series={stats.series} granularity={granularity} />
+          </div>
+        )}
+      </div>
+
+      {stats && (
+        <div className="rounded-2xl border border-forest-900/8 bg-paper-card p-4 shadow-soft sm:p-6">
+          <p className="mb-4 text-xs font-semibold uppercase tracking-wide text-ink-faint">Санат бойынша</p>
+          <ShareBar counts={stats.benefitTypeCounts} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// "Compare magnitude, low -> high" over an ORDERED sequence of stages
+// (draft -> submitted -> decided) — anti-patterns.md calls out exactly this
+// shape ("Ordered categories (funnel, tiers, age bands) -> the ordinal
+// ramp"), so each stage steps one shade darker along the reference
+// sequential-blue ramp instead of getting an unrelated categorical hue per
+// bar. The final stage is where the story turns into an *outcome*, so
+// that bar alone splits into the reserved status colors (approved/
+// rejected) rather than continuing the ordinal ramp — status color only
+// where something is actually being judged good/bad.
+const FUNNEL_RAMP = ['#6da7ec', '#2a78d6', '#184f95'];
+
+function ApplicationFunnel({ statusCounts }: { statusCounts: Record<ApplicationStatus, number> }) {
+  const created = STATUS_ORDER.reduce((sum, s) => sum + statusCounts[s], 0);
+  const submitted = statusCounts.pending_review + statusCounts.approved + statusCounts.rejected;
+  const decided = statusCounts.approved + statusCounts.rejected;
+  const stages = [
+    { label: 'Толтырылды', value: created, color: FUNNEL_RAMP[0]! },
+    { label: 'Жіберілді', value: submitted, color: FUNNEL_RAMP[1]! },
+    { label: 'Шешім қабылданды', value: decided, color: FUNNEL_RAMP[2]! },
+  ];
+  const max = Math.max(created, 1);
+  const approvedShare = decided > 0 ? (statusCounts.approved / decided) * 100 : 0;
+
+  return (
+    <div className="flex flex-col gap-3">
+      {stages.map((s, i) => {
+        // A nonzero stage that's a tiny fraction of the first one would
+        // otherwise round to a width close to the bar's own corner radius
+        // and read as a small blob rather than "a thin bar" — floor it at
+        // a couple of visible percent so the shape still says "very few,
+        // but not none". A genuinely empty stage stays truly 0.
+        const widthPct = s.value === 0 ? 0 : Math.max((s.value / max) * 100, 2.5);
+        const prevValue = i === 0 ? null : stages[i - 1]!.value;
+        const conversionPct = prevValue && prevValue > 0 ? (s.value / prevValue) * 100 : null;
+        const isLast = i === stages.length - 1;
+        return (
+          <div key={s.label}>
+            {conversionPct !== null && (
+              <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-ink-faint">
+                <Icon name="arrow-right" className="h-3 w-3 rotate-90" />
+                {conversionPct.toFixed(0)}% жалғасты
+              </p>
+            )}
+            <div className="flex items-center gap-3">
+              <span className="w-32 shrink-0 text-sm font-medium text-ink-soft sm:w-40">{s.label}</span>
+              <div className="h-8 flex-1 overflow-hidden rounded-lg bg-forest-900/5">
+                {isLast && decided > 0 ? (
+                  <div className="flex h-full" style={{ width: `${widthPct}%` }}>
+                    <div
+                      className="h-full transition-all duration-700 ease-out"
+                      style={{ width: `${approvedShare}%`, background: STATUS_CHART_COLORS.approved }}
+                      title={`Мақұлданды: ${statusCounts.approved}`}
+                    />
+                    {statusCounts.rejected > 0 && (
+                      <div
+                        className="h-full transition-all duration-700 ease-out"
+                        style={{ width: `${100 - approvedShare}%`, background: STATUS_CHART_COLORS.rejected }}
+                        title={`Қабылданбады: ${statusCounts.rejected}`}
+                      />
+                    )}
+                  </div>
+                ) : (
+                  <div
+                    className="h-full rounded-lg transition-all duration-700 ease-out"
+                    style={{ width: `${widthPct}%`, background: s.color }}
+                  />
+                )}
+              </div>
+              <span className="w-12 shrink-0 text-right text-sm font-semibold text-ink">{formatCount(s.value)}</span>
+            </div>
+          </div>
+        );
+      })}
+      {decided > 0 && (
+        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 pl-[8.75rem] text-xs text-ink-faint sm:pl-[10.75rem]">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="h-2.5 w-2.5 rounded-full" style={{ background: STATUS_CHART_COLORS.approved }} aria-hidden />
+            Мақұлданды: {statusCounts.approved}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="h-2.5 w-2.5 rounded-full" style={{ background: STATUS_CHART_COLORS.rejected }} aria-hidden />
+            Қабылданбады: {statusCounts.rejected}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatusStackedChart({ series, granularity }: { series: AppStatsSeries[]; granularity: Granularity }) {
+  const [hovered, setHovered] = useState<number | null>(null);
+
+  const maxValue = Math.max(...series.map((p) => p.total), 1);
+  const plotWidth = CHART_WIDTH - CHART_PAD_LEFT;
+  const plotHeight = CHART_HEIGHT - CHART_PAD_TOP - CHART_PAD_BOTTOM;
+  const barGap = 3;
+  const barWidth = Math.min(48, Math.max(2, plotWidth / series.length - barGap));
+  const rowWidth = series.length * (barWidth + barGap) - barGap;
+  const rowOffset = Math.max(0, (plotWidth - rowWidth) / 2);
+  const labelStride = Math.max(1, Math.ceil(series.length / 8));
+  const gridLines = [0, 0.25, 0.5, 0.75, 1];
+  // 2px surface gap between touching segments (marks-and-anatomy.md) —
+  // the mechanism that separates them, never a stroke drawn around each.
+  const segmentGap = 2;
+
+  return (
+    <div>
+      <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1.5">
+        {STATUS_ORDER.map((s) => (
+          <span key={s} className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-soft">
+            <span className="h-2.5 w-2.5 rounded-full" style={{ background: STATUS_CHART_COLORS[s] }} aria-hidden />
+            {STATUS_LABELS[s]}
+          </span>
+        ))}
+      </div>
+      <div className="relative">
+        <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="w-full" style={{ height: 'auto' }}>
+          {gridLines.map((f) => {
+            const y = CHART_PAD_TOP + plotHeight * (1 - f);
+            return (
+              <g key={f}>
+                <line
+                  x1={CHART_PAD_LEFT}
+                  x2={CHART_WIDTH}
+                  y1={y}
+                  y2={y}
+                  stroke="currentColor"
+                  className="text-forest-900/8"
+                  strokeWidth={1}
+                />
+                <text x={0} y={y + 3} fontSize={9} className="fill-ink-faint">
+                  {formatCount(Math.round(maxValue * f))}
+                </text>
+              </g>
+            );
+          })}
+
+          {series.map((p, i) => {
+            const x = CHART_PAD_LEFT + rowOffset + i * (barWidth + barGap);
+            const showLabel = i % labelStride === 0;
+            // Only the outermost (last-stacked) non-zero segment is the
+            // bar's real "data-end" — that one gets the rounded top; the
+            // rest stay square, per marks-and-anatomy.md's "4px rounded
+            // data-end, square at the baseline" (here, at every internal
+            // seam too, not just the true baseline).
+            const topStatus = [...STATUS_ORDER].reverse().find((s) => p[s] > 0);
+            let cursorY = CHART_PAD_TOP + plotHeight;
+            const label = `${formatPeriodLabel(p.period, granularity)}, барлығы ${p.total}: ${STATUS_ORDER.filter((s) => p[s] > 0)
+              .map((s) => `${STATUS_LABELS[s]} ${p[s]}`)
+              .join(', ')}`;
+            return (
+              <g
+                key={p.period}
+                tabIndex={0}
+                role="img"
+                aria-label={label}
+                onMouseEnter={() => setHovered(i)}
+                onMouseLeave={() => setHovered((h) => (h === i ? null : h))}
+                onFocus={() => setHovered(i)}
+                onBlur={() => setHovered((h) => (h === i ? null : h))}
+                opacity={hovered === null || hovered === i ? 1 : 0.35}
+                className="outline-none"
+              >
+                {/* Enlarges the keyboard focus ring / hit area beyond the
+                    painted bar, matching the >=24px hit-target rule. */}
+                <rect x={x - barGap / 2} y={CHART_PAD_TOP} width={barWidth + barGap} height={plotHeight} fill="transparent" className="focus-visible:fill-forest-900/5" />
+                {STATUS_ORDER.map((s) => {
+                  const value = p[s];
+                  if (value <= 0) return null;
+                  const rawHeight = maxValue > 0 ? (value / maxValue) * plotHeight : 0;
+                  const segHeight = Math.max(rawHeight - segmentGap, 0.5);
+                  cursorY -= rawHeight;
+                  const segY = cursorY + segmentGap / 2;
+                  return s === topStatus ? (
+                    <path key={s} d={roundedTopRectPath(x, segY, barWidth, segHeight, 3)} fill={STATUS_CHART_COLORS[s]} />
+                  ) : (
+                    <rect key={s} x={x} y={segY} width={barWidth} height={segHeight} fill={STATUS_CHART_COLORS[s]} />
+                  );
+                })}
+                {showLabel && (
+                  <text x={x + barWidth / 2} y={CHART_HEIGHT - 6} fontSize={9} textAnchor="middle" className="fill-ink-faint">
+                    {formatPeriodLabel(p.period, granularity)}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+
+        {hovered !== null && series[hovered] && (
+          <div
+            className="pointer-events-none absolute -top-2 -translate-x-1/2 -translate-y-full rounded-lg bg-forest-950 px-3 py-2 text-xs font-semibold text-paper-soft shadow-lifted"
+            style={{
+              left: `${clampPct(
+                ((CHART_PAD_LEFT + rowOffset + hovered * (barWidth + barGap) + barWidth / 2) / CHART_WIDTH) * 100,
+              )}%`,
+            }}
+          >
+            <p className="mb-1">
+              {formatPeriodLabel(series[hovered]!.period, granularity)} · {formatCount(series[hovered]!.total)}
+            </p>
+            {STATUS_ORDER.filter((s) => series[hovered]![s] > 0).map((s) => (
+              <p key={s} className="flex items-center gap-1.5">
+                <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: STATUS_CHART_COLORS[s] }} aria-hidden />
+                <span className="font-bold text-paper-soft">{formatCount(series[hovered]![s])}</span>
+                <span className="text-paper-soft/60">{STATUS_LABELS[s]}</span>
+              </p>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// A rect with only its top-left/top-right corners rounded — SVG <rect rx>
+// rounds all four, which would round a stacked segment's bottom corners
+// too (the seam against the segment below it, not a real data-end).
+function roundedTopRectPath(x: number, y: number, w: number, h: number, r: number): string {
+  const rr = Math.min(r, w / 2, Math.max(h, 0));
+  return `M${x},${y + h} L${x},${y + rr} Q${x},${y} ${x + rr},${y} L${x + w - rr},${y} Q${x + w},${y} ${x + w},${y + rr} L${x + w},${y + h} Z`;
+}
+
+// Keeps a percentage-positioned, center-anchored (-translate-x-1/2)
+// tooltip from spilling past the chart's left/right edges near the
+// first/last bar or point — clamping the anchor a little inside the edge
+// is enough since the box stays centered on it either way.
+function clampPct(pct: number, margin = 8): number {
+  return Math.min(100 - margin, Math.max(margin, pct));
+}
+
+// Part-to-whole -> stacked bar (choosing-a-form.md; donut stays
+// deprioritized per components.md's own system notes). One horizontal bar
+// carries the share at a glance; the rows below keep the exact counts
+// (and the mark-and-anatomy label rule — a value only goes inside a
+// segment when it actually fits, otherwise it moves to the legend/tooltip).
+function ShareBar({ counts }: { counts: Record<string, number> }) {
+  const entries = (['many_children_family', 'incomplete_family', 'disability'] as const).map((key) => ({
+    key,
+    label: BENEFIT_LABELS[key],
+    value: counts[key] ?? 0,
+    color: BENEFIT_CHART_COLORS[key],
+  }));
+  const total = entries.reduce((sum, e) => sum + e.value, 0);
+  const nonZero = entries.filter((e) => e.value > 0);
+
+  if (total === 0) {
+    return <p className="text-sm text-ink-faint">Деректер жоқ.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div>
+        <div className="flex h-8 w-full overflow-hidden rounded-lg bg-forest-900/5">
+          {nonZero.map((e, i) => {
+            const pct = (e.value / total) * 100;
+            const showInlineLabel = pct >= 12;
+            return (
+              <div
+                key={e.key}
+                className={`flex h-full items-center justify-center transition-all duration-700 ease-out ${i > 0 ? 'ml-0.5' : ''}`}
+                style={{ width: `${pct}%`, background: e.color }}
+                title={`${e.label}: ${formatCount(e.value)} (${pct.toFixed(0)}%)`}
+              >
+                {/* Inline label only when it actually fits — otherwise it
+                    stays out of the segment and lives in the legend below
+                    (marks-and-anatomy.md: never clip, never force it in). */}
+                {showInlineLabel && <span className="text-xs font-bold text-white">{pct.toFixed(0)}%</span>}
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-1.5 text-[11px] text-ink-faint">
+          Бір өтінімде бірнеше санат болуы мүмкін болғандықтан, үлес барлық таңдаулардың ішіндегі қатынасы.
+        </p>
+      </div>
+      <div className="flex flex-col gap-2.5">
+        {entries.map((e) => (
+          <div key={e.key} className="flex items-center gap-3">
+            <span className="inline-flex w-24 shrink-0 items-center gap-2 text-sm leading-tight text-ink-soft sm:w-36">
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: e.color }} aria-hidden />
+              {e.label}
+            </span>
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-forest-900/5">
+              <div
+                className="h-full rounded-full transition-all duration-500"
+                style={{ width: `${total > 0 ? (e.value / total) * 100 : 0}%`, background: e.color }}
+              />
+            </div>
+            <span className="w-10 shrink-0 text-right text-sm font-semibold text-ink">{formatCount(e.value)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ActionButton({ tone, onClick }: { tone: 'approve' | 'reject'; onClick: () => void }) {
   const config = {
-    approve: { label: 'Approve', className: 'bg-forest-600 text-paper-soft hover:bg-forest-700' },
-    reject: { label: 'Reject', className: 'bg-clay-400/15 text-clay-500 hover:bg-clay-400/25' },
+    approve: { label: 'Мақұлдау', className: 'bg-forest-600 text-paper-soft hover:bg-forest-700' },
+    reject: { label: 'Қабылдамау', className: 'bg-clay-400/15 text-clay-500 hover:bg-clay-400/25' },
   }[tone];
 
   return (

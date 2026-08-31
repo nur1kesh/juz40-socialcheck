@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
 import { getCurrentAdmin } from '@/lib/adminSession';
 import type { ApplicationStatus, BenefitType, Prisma } from '@prisma/client';
-import { almatyDayBoundsUtc } from '@/lib/timezone';
+import { almatyLocalToUtc } from '@/lib/timezone';
 
 const VALID_STATUSES: ApplicationStatus[] = ['draft', 'pending_review', 'approved', 'rejected'];
 const VALID_BENEFIT_TYPES: BenefitType[] = ['many_children_family', 'incomplete_family', 'disability'];
@@ -16,7 +16,9 @@ export async function GET(req: NextRequest) {
   const status = params.get('status');
   const benefitType = params.get('benefitType');
   const email = params.get('email');
-  const date = params.get('date'); // YYYY-MM-DD
+  const dateFrom = params.get('dateFrom'); // YYYY-MM-DDTHH:mm, Almaty local
+  const dateTo = params.get('dateTo');
+  const DATETIME_LOCAL_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
 
   if (status && !VALID_STATUSES.includes(status as ApplicationStatus)) {
     return NextResponse.json({ error: 'status мәні дұрыс емес' }, { status: 400 });
@@ -24,8 +26,11 @@ export async function GET(req: NextRequest) {
   if (benefitType && !VALID_BENEFIT_TYPES.includes(benefitType as BenefitType)) {
     return NextResponse.json({ error: 'benefitType мәні дұрыс емес' }, { status: 400 });
   }
-  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return NextResponse.json({ error: 'date форматы YYYY-MM-DD болуы керек' }, { status: 400 });
+  if (dateFrom && !DATETIME_LOCAL_RE.test(dateFrom)) {
+    return NextResponse.json({ error: 'dateFrom форматы YYYY-MM-DDTHH:mm болуы керек' }, { status: 400 });
+  }
+  if (dateTo && !DATETIME_LOCAL_RE.test(dateTo)) {
+    return NextResponse.json({ error: 'dateTo форматы YYYY-MM-DDTHH:mm болуы керек' }, { status: 400 });
   }
 
   const where: Prisma.ApplicationWhereInput = {};
@@ -37,14 +42,16 @@ export async function GET(req: NextRequest) {
   where.status = status ? (status as ApplicationStatus) : { not: 'draft' };
   if (benefitType) where.benefitTypes = { has: benefitType as BenefitType };
   if (email) where.user = { email: { contains: email, mode: 'insensitive' } };
-  if (date) {
-    const [yyyy, mm, dd] = date.split('-') as [string, string, string];
-    const { start, end } = almatyDayBoundsUtc(dd, mm, yyyy);
+  if (dateFrom || dateTo) {
     // "Жіберілген" (submitted) is what the admin UI labels and sorts this
     // by — filtering on createdAt (draft-creation time) would silently
-    // miss applications submitted on this date but started earlier, and
-    // catch ones started on this date but submitted later.
-    where.submittedAt = { gte: start, lte: end };
+    // miss applications submitted in this range but started earlier, and
+    // catch ones started in range but submitted later. Either end of the
+    // range can be omitted (open-ended "before"/"since" filter).
+    where.submittedAt = {
+      ...(dateFrom ? { gte: almatyLocalToUtc(dateFrom) } : {}),
+      ...(dateTo ? { lte: almatyLocalToUtc(dateTo) } : {}),
+    };
   }
 
   const [applications, totalCount] = await Promise.all([

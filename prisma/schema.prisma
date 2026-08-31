@@ -117,6 +117,36 @@ model Application {
   attemptNumber      Int               @default(1) @map("attempt_number")
   previousApplicationId String?        @map("previous_application_id")
   submittedAt        DateTime?         @map("submitted_at")
+  // Set only when an admin manually approves this application (see
+  // decideApplicationAsAdmin) — the admin picks the limit by hand instead
+  // of it being derived from document expiry dates. When null (the
+  // auto-decision path, decideAutomatically), the limit is computed on
+  // the fly from documents via discountLimitMonths() — see every call
+  // site of that function for the `manualLimitMonths ?? discountLimitMonths(...)`
+  // fallback pattern.
+  manualLimitMonths  Int?              @map("manual_limit_months")
+  // Set once the admin confirms (via the "Excel ПФ" activation import,
+  // matched by the student's email — see activateDiscount.ts) that this
+  // approved application's discount is actually live in Kaspi/the school's
+  // billing system, not just decided in our own DB. Null until then, even
+  // for an approved application — "approved" only means our own review
+  // passed; this is the downstream confirmation the student is waiting on.
+  discountActivatedAt DateTime?        @map("discount_activated_at")
+  // Set when the student reports, after seeing the "activated" notice,
+  // that the discount still isn't showing up for them. Deliberately
+  // separate from `status` (which stays 'approved' the whole time) and
+  // from the ordinary pending_review flow — this is a narrower complaint
+  // ("it says activated but isn't") that only ever applies after
+  // discountActivatedAt is set, not a re-review of the application itself.
+  // Cleared back to null once an admin resolves it.
+  activationDisputedAt DateTime?       @map("activation_disputed_at")
+  // Set exactly once, the moment status flips to 'approved'/'rejected'
+  // (decideApplicationAsAdmin, or the auto-decision branch of submit) —
+  // deliberately NOT `updatedAt`, which Prisma's @updatedAt bumps on every
+  // later write to the row (discountActivatedAt, activationDisputedAt),
+  // long after the actual decision. The renewal cooldown in
+  // applications/route.ts needs the real decision time to stay fixed.
+  decidedAt          DateTime?         @map("decided_at")
   createdAt          DateTime          @default(now()) @map("created_at")
   updatedAt          DateTime          @updatedAt @map("updated_at")
 
@@ -153,6 +183,11 @@ model Document {
   application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 
   @@index([applicationId])
+  // Backstop against the upload route's read-then-delete-then-create swap
+  // racing itself (two concurrent uploads of the same slot) — decision
+  // logic elsewhere (autoDecision.ts, discountLimit.ts) assumes at most one
+  // document per type per application via `.find()`/`.filter()`.
+  @@unique([applicationId, documentType])
   @@map("documents")
 }
 
