@@ -6,16 +6,24 @@ import { NextRequest, NextResponse } from 'next/server';
 // security headers.
 export function middleware(req: NextRequest) {
   const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
-  // Next.js dev mode's Fast Refresh relies on eval(); production builds don't need it.
-  // For admin pages, we need to be more permissive since they handle sensitive operations
+  // For admin pages, we need to allow inline scripts without nonce
+  // (Next.js inline scripts don't have nonce attributes)
   const isAdminPath = req.nextUrl.pathname.startsWith('/admin');
-  const scriptSrc = isAdminPath
-    ? `script-src 'self' 'nonce-${nonce}' 'unsafe-inline'`
-    : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${
-        process.env.NODE_ENV !== 'production' ? " 'unsafe-eval'" : ''
-      };`;
   
-  const csp = `default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; ${scriptSrc} frame-ancestors 'none'; base-uri 'self';`;
+  let scriptSrc: string;
+  let csp: string;
+  
+  if (isAdminPath) {
+    // Admin pages: allow inline scripts and external scripts
+    scriptSrc = `script-src 'self' 'unsafe-inline';`;
+    csp = `default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; ${scriptSrc} frame-ancestors 'none'; base-uri 'self';`;
+  } else {
+    // Public pages: strict CSP with nonce
+    scriptSrc = `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${
+      process.env.NODE_ENV !== 'production' ? " 'unsafe-eval'" : ''
+    };`;
+    csp = `default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; ${scriptSrc} frame-ancestors 'none'; base-uri 'self';`;
+  }
 
   const requestHeaders = new Headers(req.headers);
   requestHeaders.set('x-nonce', nonce);
