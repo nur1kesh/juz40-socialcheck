@@ -6,7 +6,7 @@
     "postinstall": "prisma generate",
     "dev": "next dev",
     "build": "next build",
-    "start": "prisma migrate deploy && next start",
+    "start": "prisma migrate deploy && npm run db:seed && next start",
     "lint": "next lint",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
@@ -36,3 +36,4 @@
     "typescript": "^5.6.2"
   }
 }
+
