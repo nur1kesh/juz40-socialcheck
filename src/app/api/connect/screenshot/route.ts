@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ALLOWED_MIME_TYPES, MAX_FILE_SIZE_BYTES, verifyFileSignature } from '@/lib/storage';
 import { extractProfileFromScreenshot } from '@/lib/profileOcr';
-import { rateLimit } from '@/lib/rateLimit';
 
 const IMAGE_MIME_TYPES = ALLOWED_MIME_TYPES.filter((m) => m !== 'application/pdf');
 
@@ -10,21 +9,6 @@ const IMAGE_MIME_TYPES = ALLOWED_MIME_TYPES.filter((m) => m !== 'application/pdf
 // even those are never trusted directly: the student must review/edit them
 // before /api/connect/confirm creates a session.
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') ?? 'unknown';
-  if (!rateLimit(`connect-screenshot:${ip}`, 10, 60_000)) {
-    return NextResponse.json({ error: 'Тым көп сұраныс' }, { status: 429 });
-  }
-  // The per-IP limit above is keyed on a client-controllable header
-  // (X-Forwarded-For) with no reverse-proxy trust boundary configured, so
-  // it's bypassable by an attacker who varies it per request. This endpoint
-  // is unauthenticated and calls paid OpenAI vision on every hit — a fixed
-  // site-wide daily ceiling bounds worst-case spend/abuse regardless of how
-  // many distinct (real or spoofed) IPs a request comes from. 300/day is
-  // generous for real onboarding traffic; tune if the school is larger.
-  if (!rateLimit('connect-screenshot:daily-global', 300, 24 * 60 * 60_000)) {
-    return NextResponse.json({ error: 'Тым көп сұраныс. Ертең қайталаңыз.' }, { status: 429 });
-  }
-
   const formData = await req.formData().catch(() => null);
   const file = formData?.get('file');
   if (!(file instanceof File)) {

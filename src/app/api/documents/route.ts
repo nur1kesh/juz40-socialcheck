@@ -11,7 +11,6 @@ import {
   deleteDocumentFile,
 } from '@/lib/storage';
 import { runOcr, namesLikelyMatch } from '@/lib/ocr';
-import { rateLimit } from '@/lib/rateLimit';
 import { isPastAlmatyDay } from '@/lib/timezone';
 
 const CONFIDENCE_THRESHOLD = 0.75;
@@ -54,13 +53,6 @@ const CATEGORY_LABELS: Record<string, string> = {
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser();
   if (!user) return NextResponse.json({ error: 'Авторизация қажет' }, { status: 401 });
-
-  // This is the one endpoint on the whole site that calls a paid OpenAI
-  // vision request per hit — keyed by user, not IP, since it's already
-  // authenticated and IP-sharing (NAT, campus wifi) shouldn't tighten it.
-  if (!rateLimit(`documents:${user.id}`, 15, 10 * 60_000)) {
-    return NextResponse.json({ error: 'Тым көп сұраныс. Сәл кейін қайталаңыз.' }, { status: 429 });
-  }
 
   const formData = await req.formData().catch(() => null);
   const file = formData?.get('file');

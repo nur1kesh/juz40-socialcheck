@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
 import { createSession } from '@/lib/session';
-import { rateLimit } from '@/lib/rateLimit';
 import { profileFieldsSchema } from '@/lib/validation';
 
 // This is the trust boundary: whatever OCR guessed, the student has now
@@ -13,11 +12,6 @@ import { profileFieldsSchema } from '@/lib/validation';
 // identity key (upsert target) — a repeat visit with the same email
 // updates the same user record instead of creating a duplicate.
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') ?? 'unknown';
-  if (!rateLimit(`connect-confirm:${ip}`, 10, 60_000)) {
-    return NextResponse.json({ error: 'Тым көп сұраныс' }, { status: 429 });
-  }
-
   const parsed = profileFieldsSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json(
